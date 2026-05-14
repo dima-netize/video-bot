@@ -1,364 +1,441 @@
 """
-Універсальний Video Downloader Bot
-Найкраща якість | Прогрес зі швидкістю | Прямі посилання | YouTube, TikTok, Instagram, Twitter, Vimeo, Reddit, Facebook, Likee, Snapchat
+Швидкий Video Downloader Bot
+YouTube, TikTok, Instagram, Twitter, Vimeo, Reddit, Facebook, Likee, Snapchat
+Найкраща якість | Прогрес у реальному часі
 """
-import os, re, asyncio, logging, traceback, time
+
+from __future__ import annotations
+
+import asyncio
+import glob
+import logging
+import os
+import re
+import time
+import traceback
+from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
+from typing import Callable
+
 import requests
 import yt_dlp
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# --- Налаштування ---
+# ── Налаштування ─────────────────────────────────────────────────────────────
+
 TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise ValueError("Не задано змінну оточення TOKEN")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-MAX_VIDEO_MB = 50
-TELEGRAM_MAX = MAX_VIDEO_MB * 1024 * 1024
 
-# Патерни для розпізнавання платформ
-URL_PATTERNS = {
-    "youtube": r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+",
-    "tiktok": r"(?:https?://)?(?:www\.)?(?:tiktok\.com/@[\w.-]+/video/\d+|vt\.tiktok\.com/\w+|vm\.tiktok\.com/\w+)",
-    "instagram": r"(?:https?://)?(?:www\.)?instagram\.com/(?:reel|p|tv|stories)/[\w-]+",
-    "twitter": r"(?:https?://)?(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+",
-    "vimeo": r"(?:https?://)?(?:www\.)?vimeo\.com/\d+",
-    "reddit": r"(?:https?://)?(?:www\.)?reddit\.com/r/\w+/comments/\w+/\w+",
-    "facebook": r"(?:https?://)?(?:www\.)?facebook\.com/(?:watch/?v=|[\w.]+/videos/)\d+",
-    "likee": r"(?:https?://)?(?:www\.)?likee\.com/v/\w+",
-    "snapchat": r"(?:https?://)?(?:www\.)?snapchat\.com/spotlight/\w+",
+MAX_VIDEO_BYTES = 50 * 1024 * 1024   # 50 МБ — ліміт Telegram для video
+PROGRESS_THROTTLE = 1.5              # секунди між оновленнями прогресу
+
+# ── Патерни URL ───────────────────────────────────────────────────────────────
+
+URL_PATTERNS: dict[str, re.Pattern] = {
+    name: re.compile(pat, re.IGNORECASE)
+    for name, pat in {
+        "youtube":   r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+",
+        "tiktok":    r"(?:https?://)?(?:www\.)?(?:tiktok\.com/@[\w.-]+/video/\d+|vt\.tiktok\.com/\w+|vm\.tiktok\.com/\w+)",
+        "instagram": r"(?:https?://)?(?:www\.)?instagram\.com/(?:reel|p|tv|stories)/[\w-]+",
+        "twitter":   r"(?:https?://)?(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+",
+        "vimeo":     r"(?:https?://)?(?:www\.)?vimeo\.com/\d+",
+        "reddit":    r"(?:https?://)?(?:www\.)?reddit\.com/r/\w+/comments/\w+",
+        "facebook":  r"(?:https?://)?(?:www\.)?facebook\.com/(?:watch/?v=|[\w.]+/videos/)\d+",
+        "likee":     r"(?:https?://)?(?:www\.)?likee\.com/v/\w+",
+        "snapchat":  r"(?:https?://)?(?:www\.)?snapchat\.com/spotlight/\w+",
+    }.items()
 }
-# Прямі посилання на відеофайли
-DIRECT_VIDEO_PATTERN = r"https?://\S+\.(?:mp4|mov|webm)(?:\?\S*)?"
 
-HELP_TEXT = """
-🎥 **Вітаю! Я — Video Downloader Bot.**
-Надішли мені посилання — і я миттєво завантажу відео в найкращій якості **без водяних знаків**.
+DIRECT_VIDEO_RE = re.compile(
+    r"https?://\S+\.(?:mp4|mov|webm)(?:\?\S*)?", re.IGNORECASE
+)
 
-🔗 **Підтримую:**
-YouTube • TikTok • Instagram • Twitter • Vimeo • Reddit • Facebook • Likee • Snapchat
-🎞️ Також приймаю **прямі посилання** на .mp4 / .mov / .webm
+HELP_TEXT = (
+    "🎥 *Video Downloader Bot*\n"
+    "Кинь посилання — отримай відео в найкращій якості\\.\n\n"
+    "Підтримую: YouTube, TikTok, Instagram, Twitter/X, Vimeo, "
+    "Reddit, Facebook, Likee, Snapchat\\.\n"
+    "Також приймаю прямі посилання на \\.mp4/\\.mov/\\.webm\n\n"
+    "🎵 `/audio` у відповідь на посилання — тільки звук \\(MP3\\)\\.\n"
+    "📊 `/stats` — статистика завантажень\\."
+)
 
-🎵 **Команди:**
-/audio (у відповідь на повідомлення з посиланням) — надішлю тільки музику (MP3)
-/formats <посилання> — покажу доступні якості без завантаження
-/stats — статистика завантажень бота
-"""
+# ── Стан ─────────────────────────────────────────────────────────────────────
 
-# Статистика
-stats = {"total": 0, "platforms": {}}
+@dataclass
+class Stats:
+    total: int = 0
+    platforms: dict[str, int] = field(default_factory=dict)
 
-def get_cookies():
-    if os.path.exists("cookies.txt"):
-        return "cookies.txt"
+    def record(self, platform: str) -> None:
+        self.total += 1
+        self.platforms[platform] = self.platforms.get(platform, 0) + 1
+
+    def render(self) -> str:
+        lines = [f"📊 Всього завантажень: {self.total}"]
+        lines += [f"• {p}: {c}" for p, c in sorted(self.platforms.items())]
+        return "\n".join(lines)
+
+stats = Stats()
+
+# Захист від паралельних завантажень одним юзером
+_user_locks: dict[int, asyncio.Lock] = {}
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in _user_locks:
+        _user_locks[user_id] = asyncio.Lock()
+    return _user_locks[user_id]
+
+# ── Допоміжні функції ─────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=1)
+def _cookies_file() -> str | None:
+    path = "cookies.txt"
+    return path if os.path.exists(path) else None
+
+
+def _safe_filename(prefix: str, url: str, ext: str = "mp4") -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    slug = re.sub(r"\W+", "_", url.split("/")[-1])[:30]
+    return os.path.join(DOWNLOAD_DIR, f"{prefix}_{slug}_{ts}.{ext}")
+
+
+def _extract_url(text: str) -> str | None:
+    """Витягує перше URL з довільного тексту."""
+    m = re.search(r"https?://\S+", text)
+    return m.group(0) if m else None
+
+
+def _detect_platform(url: str) -> str | None:
+    for name, pat in URL_PATTERNS.items():
+        if pat.search(url):
+            return name
     return None
 
-def make_filepath(prefix, url, ext="mp4"):
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    sid = re.sub(r'\W+', '_', url.split("/")[-1])[:30]
-    return os.path.join(DOWNLOAD_DIR, f"{prefix}_{sid}_{ts}.{ext}")
+# ── Завантаження ──────────────────────────────────────────────────────────────
 
-# --- Клас для оновлення прогресу ---
-class ProgressUpdater:
-    def __init__(self, msg, loop):
-        self.msg = msg
-        self.loop = loop
-        self.last_percent = -1
-        self.start_time = time.time()
-    def hook(self, d):
-        if d['status'] == 'downloading':
-            downloaded = d.get('downloaded_bytes', 0)
-            total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
-            if total:
-                percent = int(downloaded * 100 / total)
-                speed = d.get('speed', 0)
-                if speed:
-                    speed_mb = speed / (1024*1024)
-                    text = f"⏳ {percent}% ({downloaded/(1024*1024):.1f} / {total/(1024*1024):.1f} MB) • {speed_mb:.1f} MB/s"
-                else:
-                    text = f"⏳ {percent}% ({downloaded/(1024*1024):.1f} / {total/(1024*1024):.1f} MB)"
-                if percent != self.last_percent:
-                    asyncio.run_coroutine_threadsafe(self._update(text), self.loop)
-                    self.last_percent = percent
-    async def _update(self, text):
-        try:
-            await self.msg.edit_text(text)
-        except:
-            pass
-
-# --- Завантаження через yt-dlp ---
-def download_ytdlp(url, platform=None, audio_only=False):
-    progress = None  # буде заповнено пізніше
-    opts = {
-        'format': 'bestaudio/best' if audio_only else 'bestvideo+bestaudio/best',
-        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s_%(id)s.%(ext)s'),
-        'merge_output_format': 'mp4' if not audio_only else None,
-        'quiet': True,
-        'http_headers': {'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36'},
+def _build_ydl_opts(
+    platform: str | None,
+    audio: bool,
+    progress_hook: Callable | None,
+) -> dict:
+    opts: dict = {
+        "format": "bestaudio/best" if audio else "bestvideo+bestaudio/best",
+        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s_%(id)s.%(ext)s"),
+        "merge_output_format": None if audio else "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 12; Pixel 6) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Mobile Safari/537.36"
+            )
+        },
     }
-    if audio_only:
-        opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }]
-    else:
-        opts['postprocessors'] = [{'key': 'FFmpegFixupM4a'}]  # лагодження звуку
 
-    # YouTube без cookies – мобільний клієнт
     if platform == "youtube":
-        opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
 
-    # Додаємо cookies якщо є
-    cookies = get_cookies()
-    if cookies:
-        opts['cookiefile'] = cookies
-        logger.info("Використовую cookies.txt")
+    if audio:
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
 
-    # Зберігаємо прогрес
-    def progress_hook(d):
-        if progress:
-            progress.hook(d)
+    ck = _cookies_file()
+    if ck:
+        opts["cookiefile"] = ck
 
-    opts['progress_hooks'] = [progress_hook]
+    if progress_hook:
+        opts["progress_hooks"] = [progress_hook]
+
+    return opts
+
+
+def download_media(
+    url: str,
+    platform: str | None = None,
+    audio: bool = False,
+    progress_cb: Callable[[str], None] | None = None,
+) -> tuple[str | None, str]:
+    """Блокуюче завантаження. Повертає (шлях, назва) або (None, повідомлення_про_помилку)."""
+
+    last_call: list[float] = [0.0]
+
+    def hook(d: dict) -> None:
+        if progress_cb and d["status"] == "downloading":
+            now = time.monotonic()
+            if now - last_call[0] < PROGRESS_THROTTLE:
+                return
+            last_call[0] = now
+            total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+            done  = d.get("downloaded_bytes", 0)
+            speed = d.get("speed") or 0
+            if total:
+                pct   = int(done * 100 / total)
+                speed_s = f" • {speed / 1_048_576:.1f} MB/s" if speed else ""
+                progress_cb(
+                    f"⏳ {pct}% ({done / 1_048_576:.1f}/{total / 1_048_576:.1f} MB{speed_s})"
+                )
+
+    opts = _build_ydl_opts(platform, audio, hook if progress_cb else None)
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if audio_only:
-                filepath = ydl.prepare_filename(info)
-                filepath = filepath.rsplit('.', 1)[0] + '.mp3'
-            else:
-                filepath = ydl.prepare_filename(info)
-                if not os.path.exists(filepath):
-                    import glob
-                    candidates = glob.glob(os.path.join(DOWNLOAD_DIR, f"*{info['id']}*"))
-                    filepath = candidates[0] if candidates else None
+            info     = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+
+            if audio:
+                filepath = os.path.splitext(filepath)[0] + ".mp3"
+            elif not os.path.exists(filepath):
+                candidates = glob.glob(
+                    os.path.join(DOWNLOAD_DIR, f"*{info['id']}*")
+                )
+                filepath = candidates[0] if candidates else None
+
             if not filepath or not os.path.exists(filepath):
-                return None, "Файл не знайдено"
-            return filepath, info.get('title', 'video')
-    except Exception as e:
-        err = str(e)
-        if "Sign in" in err:
-            return None, "Потрібна авторизація (YouTube вимагає вхід). Спробуйте пізніше або додайте файл cookies.txt"
-        return None, f"Помилка: {err[:200]}"
+                return None, "Файл після завантаження не знайдено."
 
-# --- Завантаження прямих посилань ---
-def download_direct(url):
+            return filepath, info.get("title", "video")
+
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e)
+        if "Sign in" in msg or "login" in msg.lower():
+            return None, (
+                "Потрібна авторизація. Додайте файл cookies.txt або спробуйте пізніше."
+            )
+        return None, f"Помилка завантаження: {msg[:300]}"
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Несподівана помилка download_media")
+        return None, f"Внутрішня помилка: {e}"
+
+
+def download_direct(url: str) -> tuple[str | None, str]:
+    """Завантажує пряме відео-посилання через requests."""
+    ext = (url.split(".")[-1].split("?")[0] or "mp4")[:4]
+    filepath = _safe_filename("direct", url, ext)
     try:
-        resp = requests.get(url, stream=True, timeout=30, headers={
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36'
-        })
-        resp.raise_for_status()
-        total = int(resp.headers.get('content-length', 0))
-        filepath = make_filepath("direct", url, url.split('.')[-1].split('?')[0])
-        downloaded = 0
-        with open(filepath, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-                downloaded += len(chunk)
+        with requests.get(
+            url,
+            stream=True,
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as resp:
+            resp.raise_for_status()
+            with open(filepath, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=65_536):
+                    fh.write(chunk)
         return filepath, "Пряме відео"
-    except Exception as e:
-        return None, f"Помилка прямого завантаження: {str(e)[:200]}"
-
-# --- Надсилання файлу ---
-async def send_file(update, filepath, title, is_audio=False):
-    size = os.path.getsize(filepath)
-    try:
-        if is_audio:
-            with open(filepath, 'rb') as f:
-                await update.message.reply_audio(audio=f, title=title[:64])
-        elif size > TELEGRAM_MAX:
-            with open(filepath, 'rb') as f:
-                await update.message.reply_document(document=f, caption=f"📁 {title}")
-        else:
-            with open(filepath, 'rb') as f:
-                await update.message.reply_video(video=f, caption=f"✅ {title}", supports_streaming=True)
-    except Exception as e:
-        logger.error(f"Send error: {e}")
-        await update.message.reply_text("❌ Не вдалося надіслати файл.")
-    finally:
+    except requests.RequestException as e:
         if os.path.exists(filepath):
             os.remove(filepath)
+        return None, f"Не вдалося завантажити: {e}"
 
-# --- Обробник повідомлень ---
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+# ── Надсилання файлу ──────────────────────────────────────────────────────────
 
-    # Перевірка на пряме відео
-    if re.match(DIRECT_VIDEO_PATTERN, text):
-        msg = await update.message.reply_text("⏳ Завантажую пряме відео...")
+async def send_media(
+    update: Update,
+    filepath: str,
+    title: str,
+    is_audio: bool = False,
+) -> None:
+    size = os.path.getsize(filepath)
+    try:
+        with open(filepath, "rb") as fh:
+            if is_audio:
+                await update.message.reply_audio(audio=fh, title=title[:64])
+            elif size > MAX_VIDEO_BYTES:
+                await update.message.reply_document(
+                    document=fh, caption=f"📁 {title[:200]}"
+                )
+            else:
+                await update.message.reply_video(
+                    video=fh,
+                    caption=f"✅ {title[:200]}",
+                    supports_streaming=True,
+                )
+    except Exception:
+        logger.exception("Помилка надсилання файлу")
+        await update.message.reply_text("❌ Не вдалося надіслати файл.")
+    finally:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+
+# ── Обробники команд ──────────────────────────────────────────────────────────
+
+async def _download_and_send(
+    update: Update,
+    url: str,
+    platform: str,
+    audio: bool = False,
+) -> None:
+    """Спільна логіка для handle_message та audio_command."""
+    user_id = update.message.from_user.id
+    lock     = _get_user_lock(user_id)
+
+    if lock.locked():
+        await update.message.reply_text(
+            "⏳ Зачекай — попереднє завантаження ще триває."
+        )
+        return
+
+    async with lock:
+        msg  = await update.message.reply_text(
+            "🎵 Завантажую аудіо..." if audio else "⏳ Починаю завантаження..."
+        )
         loop = asyncio.get_running_loop()
-        filepath, title = await loop.run_in_executor(None, download_direct, text)
-        if filepath is None:
+
+        # !! Захоплюємо loop ДО передачі в executor — інакше get_running_loop()
+        # з потоку executor кине RuntimeError.
+        last_edit: list[float] = [0.0]
+
+        def progress_cb(text: str) -> None:
+            now = time.monotonic()
+            if now - last_edit[0] < PROGRESS_THROTTLE:
+                return
+            last_edit[0] = now
+            asyncio.run_coroutine_threadsafe(msg.edit_text(text), loop)
+
+        path, title = await loop.run_in_executor(
+            None, download_media, url, platform, audio, progress_cb
+        )
+
+        if path is None:
             await msg.edit_text(f"❌ {title}")
             return
-        await msg.delete()
-        await send_file(update, filepath, title)
-        stats['total'] += 1
-        stats['platforms']['direct'] = stats['platforms'].get('direct', 0) + 1
+
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+        await send_media(update, path, title, is_audio=audio)
+        stats.record(platform)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+
+    # 1. Пряме посилання на відео-файл
+    if m := DIRECT_VIDEO_RE.search(text):
+        direct_url = m.group(0)
+        msg = await update.message.reply_text("⏳ Завантажую пряме відео...")
+        loop = asyncio.get_running_loop()
+        path, title = await loop.run_in_executor(None, download_direct, direct_url)
+        if path is None:
+            await msg.edit_text(f"❌ {title}")
+            return
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await send_media(update, path, title)
+        stats.record("direct")
         return
 
-    # Визначаємо платформу
-    platform = None
-    for name, pat in URL_PATTERNS.items():
-        if re.search(pat, text):
-            platform = name
-            break
+    # 2. Витягуємо URL і визначаємо платформу
+    url = _extract_url(text)
+    if not url:
+        await update.message.reply_text(
+            "❌ Надішли посилання на YouTube, TikTok, Instagram тощо."
+        )
+        return
+
+    platform = _detect_platform(url)
     if not platform:
-        await update.message.reply_text("❌ Надішли посилання на підтримуваний сайт або пряме відео.")
+        await update.message.reply_text(
+            "❌ Платформа не підтримується. Спробуй YouTube, TikTok, Instagram тощо."
+        )
         return
 
-    msg = await update.message.reply_text("⏳ Починаю завантаження...")
-    loop = asyncio.get_running_loop()
-    progress = ProgressUpdater(msg, loop)
-    # Передаємо прогрес у download_ytdlp
-    import types
-    # Невеликий хак: зберігаємо прогрес в замиканні
-    def _download_with_progress():
-        prog_ref = progress
-        def hook(d):
-            prog_ref.hook(d)
-        return download_ytdlp_inner(url, platform, False, hook)
-    # Краще переробимо download_ytdlp, щоб приймала прогрес
-    filepath, title = await loop.run_in_executor(None, download_ytdlp_with_progress, url, platform, False, progress)
-    if filepath is None:
-        await msg.edit_text(f"❌ {title}")
-        return
-    await msg.delete()
-    await send_file(update, filepath, title)
-    stats['total'] += 1
-    stats['platforms'][platform] = stats['platforms'].get(platform, 0) + 1
+    await _download_and_send(update, url, platform, audio=False)
 
-# Оновлена функція, що приймає прогрес
-def download_ytdlp_with_progress(url, platform, audio_only, progress):
-    opts = {
-        'format': 'bestaudio/best' if audio_only else 'bestvideo+bestaudio/best',
-        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s_%(id)s.%(ext)s'),
-        'merge_output_format': 'mp4' if not audio_only else None,
-        'quiet': True,
-        'http_headers': {'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36'},
-    }
-    if audio_only:
-        opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }]
-    if platform == "youtube":
-        opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
-    cookies = get_cookies()
-    if cookies:
-        opts['cookiefile'] = cookies
-    # Прогрес-хук
-    opts['progress_hooks'] = [progress.hook]
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if audio_only:
-                filepath = ydl.prepare_filename(info)
-                filepath = filepath.rsplit('.', 1)[0] + '.mp3'
-            else:
-                filepath = ydl.prepare_filename(info)
-                if not os.path.exists(filepath):
-                    import glob
-                    candidates = glob.glob(os.path.join(DOWNLOAD_DIR, f"*{info['id']}*"))
-                    filepath = candidates[0] if candidates else None
-            if not filepath or not os.path.exists(filepath):
-                return None, "Файл не знайдено"
-            return filepath, info.get('title', 'video')
-    except Exception as e:
-        err = str(e)
-        if "Sign in" in err:
-            return None, "Потрібна авторизація (YouTube). Додайте cookies.txt"
-        return None, f"Помилка: {err[:200]}"
 
-# --- Команди ---
-async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("❌ Використовуйте /audio у відповідь на повідомлення з посиланням.")
+async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    reply = update.message.reply_to_message
+    if not reply or not reply.text:
+        await update.message.reply_text(
+            "❌ Дай команду /audio у відповідь на повідомлення з посиланням."
+        )
         return
-    text = update.message.reply_to_message.text.strip()
-    platform = None
-    for name, pat in URL_PATTERNS.items():
-        if re.search(pat, text):
-            platform = name
-            break
+
+    url = _extract_url(reply.text)
+    if not url:
+        await update.message.reply_text("❌ У відповіді не знайдено посилання.")
+        return
+
+    platform = _detect_platform(url)
     if not platform:
-        await update.message.reply_text("❌ У відповіді має бути посилання на підтримуваний сайт.")
+        await update.message.reply_text(
+            "❌ Платформа не підтримується для аудіо."
+        )
         return
-    msg = await update.message.reply_text("🎵 Завантажую аудіо...")
-    loop = asyncio.get_running_loop()
-    progress = ProgressUpdater(msg, loop)
-    filepath, title = await loop.run_in_executor(None, download_ytdlp_with_progress, text, platform, True, progress)
-    if filepath is None:
-        await msg.edit_text(f"❌ {title}")
-        return
-    await msg.delete()
-    await send_file(update, filepath, title, is_audio=True)
 
-async def formats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Використання: /formats <посилання>")
-        return
-    url = context.args[0]
-    msg = await update.message.reply_text("Отримую список форматів...")
+    await _download_and_send(update, url, platform, audio=True)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(stats.render())
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_TEXT, parse_mode="MarkdownV2")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Необроблений виняток:", exc_info=context.error)
+
+# ── Запуск ────────────────────────────────────────────────────────────────────
+
+def _delete_webhook() -> None:
     try:
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            formats = info.get('formats', [])
-            out = "🎞 **Доступні формати:**\n"
-            for f in formats[:20]:
-                note = f.get('format_note', '?')
-                ext = f.get('ext', '')
-                size = f.get('filesize') or f.get('filesize_approx')
-                if size:
-                    out += f"- {note} ({ext}) — {size/(1024*1024):.1f} MB\n"
-                else:
-                    out += f"- {note} ({ext})\n"
-            await msg.edit_text(out[:4000], parse_mode="Markdown")
-    except Exception as e:
-        await msg.edit_text(f"Помилка: {str(e)[:200]}")
+        requests.get(
+            f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
+            params={"drop_pending_updates": "true"},
+            timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = "📊 **Статистика бота:**\n"
-    txt += f"Всього завантажень: {stats['total']}\n"
-    for p, c in stats['platforms'].items():
-        txt += f"• {p}: {c}\n"
-    await update.message.reply_text(txt, parse_mode="Markdown")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Exception while handling an update:", exc_info=context.error)
-
-def main():
-    # Скидання вебхука
-    try:
-        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=10)
-    except: pass
+def main() -> None:
+    _delete_webhook()
 
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("audio", audio_command))
-    app.add_handler(CommandHandler("formats", formats_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("Бот запущено...")
-    app.run_polling()
+    logger.info("Бот запущено.")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     try:
         main()
-    except:
+    except Exception:
         traceback.print_exc()
