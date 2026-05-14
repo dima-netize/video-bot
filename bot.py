@@ -45,7 +45,7 @@ DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 MAX_VIDEO_BYTES = 50 * 1024 * 1024   # 50 МБ — ліміт Telegram для video
-PROGRESS_THROTTLE = 1.5              # секунди між оновленнями прогресу
+PROGRESS_THROTTLE = 2.0              # секунди між оновленнями (Telegram rate-limit ~1 edit/s)
 
 # ── Патерни URL ───────────────────────────────────────────────────────────────
 
@@ -132,35 +132,69 @@ def _detect_platform(url: str) -> str | None:
 
 # ── Завантаження ──────────────────────────────────────────────────────────────
 
+def _has_ffmpeg() -> bool:
+    import shutil
+    return shutil.which("ffmpeg") is not None
+
+
 def _build_ydl_opts(
     platform: str | None,
     audio: bool,
     progress_hook: Callable | None,
 ) -> dict:
+    # Для аудіо без FFmpeg беремо готовий аудіо-стрім — не конвертуємо
+    ffmpeg = _has_ffmpeg()
+    audio_format = "bestaudio/best" if audio else "bestvideo+bestaudio/best"
+
+    # TikTok — мобільний UA + специфічний API
+    tiktok_ua = (
+        "com.zhiliaoapp.musically/2022600030 (Linux; U; Android 12; "
+        "en_US; Pixel 6; Build/SP1A.210812.016; Cronet/58.0.2991.0)"
+    )
+    default_ua = (
+        "Mozilla/5.0 (Linux; Android 12; Pixel 6) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Mobile Safari/537.36"
+    )
+
     opts: dict = {
-        "format": "bestaudio/best" if audio else "bestvideo+bestaudio/best",
+        "format": audio_format,
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s_%(id)s.%(ext)s"),
         "merge_output_format": None if audio else "mp4",
         "quiet": True,
         "no_warnings": True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 12; Pixel 6) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Mobile Safari/537.36"
-            )
-        },
+        "http_headers": {"User-Agent": tiktok_ua if platform == "tiktok" else default_ua},
     }
 
+    # ── Платформо-специфічні параметри ──
     if platform == "youtube":
-        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
+        # android_vr — найнадійніший незаблокований клієнт станом на 2024-25
+        opts["extractor_args"] = {
+            "youtube": {"player_client": ["android_vr", "android", "web"]}
+        }
 
-    if audio:
+    elif platform == "tiktok":
+        opts["extractor_args"] = {
+            "tiktok": {
+                # API hostname, що стабільно відповідає
+                "api_hostname": "api22-normal-c-useast2a.tiktokv.com",
+            }
+        }
+
+    elif platform == "instagram":
+        # Instagram потребує cookies для Reels; без них беремо публічний формат
+        opts["format"] = "best" if not audio else "bestaudio/best"
+
+    # ── Аудіо постпроцесор ──
+    if audio and ffmpeg:
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
+    elif audio and not ffmpeg:
+        # Без FFmpeg — скачуємо найкращий аудіо-стрім як є (зазвичай m4a/webm)
+        logger.warning("FFmpeg не знайдено — аудіо без конвертації в MP3")
 
     ck = _cookies_file()
     if ck:
@@ -180,23 +214,21 @@ def download_media(
 ) -> tuple[str | None, str]:
     """Блокуюче завантаження. Повертає (шлях, назва) або (None, повідомлення_про_помилку)."""
 
-    last_call: list[float] = [0.0]
-
     def hook(d: dict) -> None:
+        # Throttle — тільки в progress_cb знаружі; тут не фільтруємо
         if progress_cb and d["status"] == "downloading":
-            now = time.monotonic()
-            if now - last_call[0] < PROGRESS_THROTTLE:
-                return
-            last_call[0] = now
             total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
             done  = d.get("downloaded_bytes", 0)
             speed = d.get("speed") or 0
             if total:
-                pct   = int(done * 100 / total)
+                pct     = int(done * 100 / total)
                 speed_s = f" • {speed / 1_048_576:.1f} MB/s" if speed else ""
                 progress_cb(
                     f"⏳ {pct}% ({done / 1_048_576:.1f}/{total / 1_048_576:.1f} MB{speed_s})"
                 )
+            elif done:
+                # total невідомий (стрімінг без Content-Length)
+                progress_cb(f"⏳ Завантажено {done / 1_048_576:.1f} MB…")
 
     opts = _build_ydl_opts(platform, audio, hook if progress_cb else None)
 
@@ -206,7 +238,15 @@ def download_media(
             filepath = ydl.prepare_filename(info)
 
             if audio:
-                filepath = os.path.splitext(filepath)[0] + ".mp3"
+                mp3_path = os.path.splitext(filepath)[0] + ".mp3"
+                if os.path.exists(mp3_path):
+                    filepath = mp3_path
+                elif not os.path.exists(filepath):
+                    # FFmpeg відсутній — знайти будь-який аудіо-файл з цим id
+                    candidates = glob.glob(os.path.join(DOWNLOAD_DIR, f"*{info['id']}*"))
+                    audio_exts = {".m4a", ".webm", ".ogg", ".opus", ".mp3", ".aac"}
+                    candidates = [c for c in candidates if os.path.splitext(c)[1] in audio_exts]
+                    filepath = candidates[0] if candidates else None
             elif not os.path.exists(filepath):
                 candidates = glob.glob(
                     os.path.join(DOWNLOAD_DIR, f"*{info['id']}*")
@@ -221,8 +261,12 @@ def download_media(
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
         if "Sign in" in msg or "login" in msg.lower():
+            return None, "Потрібна авторизація. Додайте cookies.txt або спробуйте пізніше."
+        if "status code 0" in msg or "Video not available" in msg:
             return None, (
-                "Потрібна авторизація. Додайте файл cookies.txt або спробуйте пізніше."
+                "TikTok заблокував запит (status 0).\n"
+                "Можливі причини: гео-обмеження, приватне відео або застарілий yt-dlp.\n"
+                "Виконай: pip install -U yt-dlp"
             )
         return None, f"Помилка завантаження: {msg[:300]}"
     except Exception as e:  # noqa: BLE001
