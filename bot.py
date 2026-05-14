@@ -1,11 +1,13 @@
 """
 Telegram бот для завантаження відео без водяних знаків
 Платформи: YouTube, TikTok, Instagram, Twitter (X)
-Версія без aiohttp (тільки requests + yt-dlp)
+Стабільна версія з requests + yt-dlp
 """
 import os
 import re
+import asyncio
 import logging
+import traceback
 from datetime import datetime
 
 import requests
@@ -155,7 +157,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text(f"⏳ Завантажую відео з {platform}...")
 
-    # Запускаємо синхронне завантаження у виконавці (щоб не блокувати event loop)
     loop = asyncio.get_running_loop()
     download_func = {
         "youtube": download_youtube,
@@ -217,5 +218,10 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-    main()
+    print("Запуск бота...")
+    try:
+        main()
+    except Exception:
+        print("FATAL ERROR:")
+        traceback.print_exc()
+        raise
