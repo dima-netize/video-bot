@@ -207,21 +207,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error(msg="Помилка при обробці оновлення:", exc_info=context.error)
 
 def main():
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
-    logger.info("Бот запущено...")
-    app.run_polling()
-
-def main():
     print("DEBUG: bot.py started", flush=True)
-    print("DEBUG: BOT_TOKEN exists:", bool(TOKEN), flush=True)
+    print("DEBUG: TOKEN exists:", bool(TOKEN), flush=True)
 
     if not TOKEN:
         raise RuntimeError(
-            "Токен не знайдено. Додай BOT_TOKEN у Render → Environment."
+            "Токен не знайдено. Додай BOT_TOKEN або TOKEN у Render → Environment."
         )
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -234,3 +225,11 @@ def main():
 
     logger.info("Бот запущено...")
     app.run_polling()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        print("FATAL ERROR:")
+        traceback.print_exc()
+        raise
