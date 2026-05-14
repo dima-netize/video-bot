@@ -7,7 +7,6 @@ import os
 import re
 import asyncio
 import logging
-import traceback
 from datetime import datetime
 
 import aiohttp
@@ -278,8 +277,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        logger.exception("FATAL ERROR")
-        raise
+    main()
