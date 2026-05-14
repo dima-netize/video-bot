@@ -16,9 +16,7 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 
 # --- Налаштування ---
-TOKEN = os.environ.get("TOKEN")
-if not TOKEN:
-    raise ValueError("Не задано змінну оточення TOKEN")
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -217,11 +215,22 @@ def main():
     logger.info("Бот запущено...")
     app.run_polling()
 
-if __name__ == "__main__":
-    print("Запуск бота...")
-    try:
-        main()
-    except Exception:
-        print("FATAL ERROR:")
-        traceback.print_exc()
-        raise
+def main():
+    print("DEBUG: bot.py started", flush=True)
+    print("DEBUG: BOT_TOKEN exists:", bool(TOKEN), flush=True)
+
+    if not TOKEN:
+        raise RuntimeError(
+            "Токен не знайдено. Додай BOT_TOKEN у Render → Environment."
+        )
+
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
+
+    logger.info("Бот запущено...")
+    app.run_polling()
