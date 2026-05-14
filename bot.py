@@ -280,7 +280,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        print("FATAL ERROR:")
-        traceback.print_exc()
+    except Exception:
+        logger.exception("FATAL ERROR")
         raise
