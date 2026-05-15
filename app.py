@@ -1,32 +1,82 @@
 """
-Video Downloader Bot Pro
-YouTube, TikTok, Instagram, Twitter/X, Vimeo, Reddit, Facebook, Likee, Snapchat, Pinterest.
-
-ENV:
-TOKEN=your_telegram_bot_token
-Optional:
-YOUTUBE_COOKIES_B64=base64_of_cookies_txt
-MAX_UPLOAD_BYTES=51380224
-PARALLEL_DOWNLOADS=2
+Video Downloader Bot Pro для fps.ms/Pterodactyl.
+Сам ставить requests / yt-dlp / python-telegram-bot / imageio-ffmpeg, якщо їх немає.
 """
-
 from __future__ import annotations
+
+import importlib
+import os
+import site
+import subprocess
+import sys
+from pathlib import Path
+
+BASE_DIR_BOOT = Path(__file__).resolve().parent
+PY_VER = f"python{sys.version_info.major}.{sys.version_info.minor}"
+LOCAL_SITE = BASE_DIR_BOOT / ".local" / "lib" / PY_VER / "site-packages"
+USER_SITE = Path(site.getusersitepackages())
+
+for p in (LOCAL_SITE, USER_SITE):
+    if p.exists() and str(p) not in sys.path:
+        sys.path.insert(0, str(p))
+        site.addsitedir(str(p))
+
+
+def module_ok(name: str) -> bool:
+    try:
+        importlib.import_module(name)
+        return True
+    except Exception:
+        return False
+
+
+def pip_install(pkg: str) -> None:
+    print(f"[BOOT] Installing: {pkg}", flush=True)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "-U", pkg])
+
+    if USER_SITE.exists() and str(USER_SITE) not in sys.path:
+        sys.path.insert(0, str(USER_SITE))
+        site.addsitedir(str(USER_SITE))
+
+    importlib.invalidate_caches()
+
+
+def ensure_dependencies() -> None:
+    if os.environ.get("DISABLE_AUTO_INSTALL", "0") == "1":
+        return
+
+    deps = [
+        ("requests", "requests>=2.32.0"),
+        ("yt_dlp", "yt-dlp[default]"),
+        ("telegram.ext", "python-telegram-bot==20.7"),
+        ("imageio_ffmpeg", "imageio-ffmpeg>=0.6.0"),
+    ]
+
+    missing = [pkg for mod, pkg in deps if not module_ok(mod)]
+
+    for pkg in missing:
+        pip_install(pkg)
+
+    failed = [mod for mod, _ in deps if not module_ok(mod)]
+
+    if failed:
+        raise RuntimeError("Не вдалося встановити: " + ", ".join(failed))
+
+
+ensure_dependencies()
 
 import asyncio
 import base64
 import glob
 import json
 import logging
-import os
 import re
 import shutil
-import subprocess
 import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
-from pathlib import Path
 from threading import Event
 from typing import Any
 from urllib.parse import urljoin
@@ -43,13 +93,9 @@ except Exception:
     imageio_ffmpeg = None
 
 
-# ─────────────────────────────────────────────────────────────
-# НАЛАШТУВАННЯ
-# ─────────────────────────────────────────────────────────────
-
 TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
-    raise ValueError("Не задано змінну оточення TOKEN")
+    raise ValueError("Не задано TOKEN у Startup / Environment")
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
@@ -59,7 +105,7 @@ STATS_FILE = BASE_DIR / "bot_stats.json"
 SETTINGS_FILE = BASE_DIR / "bot_settings.json"
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(49 * 1024 * 1024)))
-PROGRESS_THROTTLE = float(os.environ.get("PROGRESS_THROTTLE", "1.3"))
+PROGRESS_THROTTLE = float(os.environ.get("PROGRESS_THROTTLE", "1.4"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
 OLD_FILE_TTL = int(os.environ.get("OLD_FILE_TTL", str(60 * 60 * 3)))
 MAX_LINKS_PER_MESSAGE = int(os.environ.get("MAX_LINKS_PER_MESSAGE", "3"))
@@ -74,10 +120,6 @@ logging.basicConfig(
 
 logger = logging.getLogger("video-bot-pro")
 
-
-# ─────────────────────────────────────────────────────────────
-# FFMPEG
-# ─────────────────────────────────────────────────────────────
 
 def find_ffmpeg() -> str | None:
     env_path = os.environ.get("FFMPEG_PATH")
@@ -99,11 +141,6 @@ def find_ffmpeg() -> str | None:
 
 
 FFMPEG_PATH = find_ffmpeg()
-
-
-# ─────────────────────────────────────────────────────────────
-# URL-ПАТЕРНИ
-# ─────────────────────────────────────────────────────────────
 
 URL_RE = re.compile(r"https?://[^\s<>\"]+", re.I)
 
@@ -155,16 +192,14 @@ URL_PATTERNS: dict[str, re.Pattern[str]] = {
     ),
 }
 
-
 HELP_TEXT = """
 🎥 Video Downloader Bot Pro
 
 Кинь посилання — бот завантажить відео і покаже прогрес.
 
-Команди:
 /video <url> — скачати відео
 /audio <url> — скачати MP3
-/audio у відповідь на повідомлення з посиланням — MP3
+/audio у відповідь на посилання — MP3
 /info <url> — інформація про відео
 /formats <url> — доступні формати
 /quality best — найкраща якість
@@ -179,16 +214,11 @@ HELP_TEXT = """
 /platforms — платформи
 /resetstats — очистити статистику
 
-Підтримка:
-YouTube, TikTok, Instagram, Twitter/X, Vimeo, Reddit, Facebook, Likee, Snapchat, Pinterest, прямі MP4/MOV/WEBM.
+Підтримка: YouTube, TikTok, Instagram, Twitter/X, Vimeo, Reddit, Facebook, Likee, Snapchat, Pinterest, прямі MP4/MOV/WEBM.
 
 Для YouTube на сервері часто потрібен cookies.txt у форматі Netscape.
 """.strip()
 
-
-# ─────────────────────────────────────────────────────────────
-# JSON STORAGE
-# ─────────────────────────────────────────────────────────────
 
 def read_json(path: Path, default: Any) -> Any:
     try:
@@ -198,28 +228,21 @@ def read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
 
     except Exception:
-        logger.exception("Не вдалося прочитати JSON: %s", path)
         return default
 
 
 def write_json(path: Path, data: Any) -> None:
     try:
         tmp = path.with_suffix(path.suffix + ".tmp")
-
         tmp.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-
         tmp.replace(path)
 
     except Exception:
-        logger.exception("Не вдалося записати JSON: %s", path)
+        logger.exception("Не вдалося записати JSON")
 
-
-# ─────────────────────────────────────────────────────────────
-# СТАТИСТИКА І СТАН
-# ─────────────────────────────────────────────────────────────
 
 @dataclass
 class Stats:
@@ -230,16 +253,16 @@ class Stats:
 
     @classmethod
     def load(cls) -> "Stats":
-        data = read_json(STATS_FILE, {})
+        d = read_json(STATS_FILE, {})
 
-        if not isinstance(data, dict):
+        if not isinstance(d, dict):
             return cls()
 
         return cls(
-            success=int(data.get("success", 0)),
-            errors=int(data.get("errors", 0)),
-            downloaded_bytes=int(data.get("downloaded_bytes", 0)),
-            platforms=dict(data.get("platforms", {})),
+            success=int(d.get("success", 0)),
+            errors=int(d.get("errors", 0)),
+            downloaded_bytes=int(d.get("downloaded_bytes", 0)),
+            platforms=dict(d.get("platforms", {})),
         )
 
     def save(self) -> None:
@@ -271,11 +294,8 @@ class Stats:
         ]
 
         if self.platforms:
-            lines.append("")
-            lines.append("За платформами:")
-
-            for platform, count in sorted(self.platforms.items()):
-                lines.append(f"• {platform}: {count}")
+            lines += ["", "За платформами:"]
+            lines += [f"• {p}: {c}" for p, c in sorted(self.platforms.items())]
 
         return "\n".join(lines)
 
@@ -298,10 +318,6 @@ class DownloadCancelled(Exception):
     pass
 
 
-# ─────────────────────────────────────────────────────────────
-# ДОПОМІЖНІ ФУНКЦІЇ
-# ─────────────────────────────────────────────────────────────
-
 def save_settings() -> None:
     write_json(
         SETTINGS_FILE,
@@ -315,13 +331,6 @@ def save_settings() -> None:
 
 
 def ensure_cookies_from_env() -> None:
-    """
-    Створює cookies.txt із Base64-змінної, якщо така є.
-
-    Підтримує:
-    YOUTUBE_COOKIES_B64
-    COOKIES_TXT_B64
-    """
     env_value = os.environ.get("YOUTUBE_COOKIES_B64") or os.environ.get("COOKIES_TXT_B64")
 
     if not env_value:
@@ -333,8 +342,7 @@ def ensure_cookies_from_env() -> None:
         return
 
     try:
-        raw = base64.b64decode(env_value.strip())
-        target.write_bytes(raw)
+        target.write_bytes(base64.b64decode(env_value.strip()))
         logger.info("cookies.txt створено зі змінної середовища")
 
     except Exception:
@@ -342,12 +350,6 @@ def ensure_cookies_from_env() -> None:
 
 
 def cookies_file() -> str | None:
-    """
-    Шукає cookies.txt у різних місцях:
-    1. /etc/secrets/cookies.txt — Render Secret Files
-    2. поруч із app.py — fps.ms / Pterodactyl
-    3. ./cookies/cookies.txt
-    """
     ensure_cookies_from_env()
 
     possible_paths = [
@@ -366,21 +368,13 @@ def cookies_file() -> str | None:
                 errors="ignore",
             ).splitlines()
 
-            first_line = lines[0].strip() if lines else ""
+            first = lines[0].strip() if lines else ""
 
-            if first_line in {
-                "# Netscape HTTP Cookie File",
-                "# HTTP Cookie File",
-            }:
+            if first in {"# Netscape HTTP Cookie File", "# HTTP Cookie File"}:
                 return str(path)
 
-            logger.warning(
-                "cookies.txt знайдено, але формат неправильний: %s",
-                first_line,
-            )
-
         except Exception:
-            logger.exception("Не вдалося прочитати cookies.txt: %s", path)
+            pass
 
     return None
 
@@ -391,31 +385,36 @@ def chat_id(update: Update) -> int:
 
 def safe_text(value: Any, limit: int = 220) -> str:
     text = re.sub(r"\s+", " ", str(value or "video")).strip()
-    return text[:limit] or "video"
+
+    if not text:
+        text = "video"
+
+    return text[:limit]
 
 
 def safe_filename(prefix: str, url: str, ext: str = "mp4") -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     slug = url.split("?")[0].rstrip("/").split("/")[-1] or "video"
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", slug)[:35] or "video"
+
     return DOWNLOAD_DIR / f"{prefix}_{slug}_{ts}.{ext}"
 
 
 def extract_urls(text: str) -> list[str]:
-    urls: list[str] = []
+    out: list[str] = []
 
     for url in URL_RE.findall(text or ""):
         url = url.strip().strip(".,;)\n\r\t ")
 
-        if url and url not in urls:
-            urls.append(url)
+        if url and url not in out:
+            out.append(url)
 
-    return urls[:MAX_LINKS_PER_MESSAGE]
+    return out[:MAX_LINKS_PER_MESSAGE]
 
 
 def detect_platform(url: str) -> str | None:
-    for name, pattern in URL_PATTERNS.items():
-        if pattern.search(url):
+    for name, pat in URL_PATTERNS.items():
+        if pat.search(url):
             return name
 
     return None
@@ -425,33 +424,33 @@ def human_bytes(num: int | float | None) -> str:
     if not num:
         return "0 B"
 
-    num = float(num)
+    n = float(num)
 
     for unit in ["B", "KB", "MB", "GB"]:
-        if num < 1024 or unit == "GB":
+        if n < 1024 or unit == "GB":
             if unit == "B":
-                return f"{int(num)} B"
+                return f"{int(n)} B"
 
-            return f"{num:.1f} {unit}"
+            return f"{n:.1f} {unit}"
 
-        num /= 1024
+        n /= 1024
 
-    return f"{num:.1f} GB"
+    return f"{n:.1f} GB"
 
 
 def seconds_text(seconds: int | float | None) -> str:
     if not seconds:
         return "0с"
 
-    seconds = int(seconds)
-    hours, rest = divmod(seconds, 3600)
-    minutes, sec = divmod(rest, 60)
+    s = int(seconds)
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
 
-    if hours:
-        return f"{hours}г {minutes}хв {sec}с"
+    if h:
+        return f"{h}г {m}хв {sec}с"
 
-    if minutes:
-        return f"{minutes}хв {sec}с"
+    if m:
+        return f"{m}хв {sec}с"
 
     return f"{sec}с"
 
@@ -508,10 +507,10 @@ def clean_old_files(force: bool = False) -> int:
     now = time.time()
     count = 0
 
-    for path in DOWNLOAD_DIR.glob("*"):
+    for p in DOWNLOAD_DIR.glob("*"):
         try:
-            if path.is_file() and (force or now - path.stat().st_mtime > OLD_FILE_TTL):
-                path.unlink()
+            if p.is_file() and (force or now - p.stat().st_mtime > OLD_FILE_TTL):
+                p.unlink()
                 count += 1
 
         except OSError:
@@ -535,7 +534,8 @@ def first_entry(info: dict[str, Any]) -> dict[str, Any]:
     if not entries:
         return info
 
-    entries = [entry for entry in entries if entry]
+    entries = [e for e in entries if e]
+
     return entries[0] if entries else info
 
 
@@ -563,13 +563,13 @@ def find_file(info: dict[str, Any], ydl) -> str | None:
         candidates += glob.glob(str(DOWNLOAD_DIR / f"*{info['id']}*"))
 
     existing = [
-        str(Path(candidate))
-        for candidate in candidates
-        if candidate and Path(candidate).exists()
+        str(Path(c))
+        for c in candidates
+        if c and Path(c).exists()
     ]
 
     existing.sort(
-        key=lambda file_path: Path(file_path).stat().st_mtime,
+        key=lambda x: Path(x).stat().st_mtime,
         reverse=True,
     )
 
@@ -587,33 +587,26 @@ def friendly_error(platform: str | None, error: str) -> str:
         or "cookies" in low
     ):
         return (
-            "YouTube заблокував запит із сервера і просить cookies.txt.\n\n"
-            "Що зробити:\n"
-            "1. Зайди в YouTube у браузері.\n"
-            "2. Експортуй cookies у форматі Netscape.\n"
-            "3. Поклади файл cookies.txt поруч із app.py.\n"
-            "4. Перезапусти сервер.\n\n"
-            "Якщо cookies вже є — вони могли протухнути."
+            "YouTube просить cookies.txt.\n\n"
+            "Поклади правильний cookies.txt поруч із app.py і перезапусти сервер.\n"
+            "Перший рядок має бути:\n"
+            "# Netscape HTTP Cookie File"
         )
 
     if "requested format is not available" in low:
         return "Ця якість недоступна. Спробуй /quality fast або /quality mobile."
 
     if "ffmpeg" in low and not FFMPEG_PATH:
-        return "Потрібен ffmpeg. Додай imageio-ffmpeg у requirements.txt або встанови ffmpeg на сервері."
+        return "Потрібен ffmpeg. Код пробує використати imageio-ffmpeg, але пакет не встановився."
 
     if "unsupported url" in low:
         return "Посилання не підтримується або платформа змінила захист."
 
     if "private" in low or "login" in low:
-        return "Відео приватне або потрібен вхід в акаунт. Для цього потрібен правильний cookies.txt."
+        return "Відео приватне або потрібен вхід в акаунт. Потрібен правильний cookies.txt."
 
     return safe_text(err, 900)
 
-
-# ─────────────────────────────────────────────────────────────
-# STREAM DOWNLOAD
-# ─────────────────────────────────────────────────────────────
 
 def stream_download(
     url: str,
@@ -633,19 +626,20 @@ def stream_download(
             stream=True,
             timeout=REQUEST_TIMEOUT,
             headers=headers,
-        ) as response:
-            response.raise_for_status()
-            total = int(response.headers.get("content-length") or 0)
+        ) as r:
+            r.raise_for_status()
 
-            with open(filepath, "wb") as file:
-                for chunk in response.iter_content(1024 * 256):
+            total = int(r.headers.get("content-length") or 0)
+
+            with open(filepath, "wb") as f:
+                for chunk in r.iter_content(1024 * 256):
                     if cancel_event and cancel_event.is_set():
                         raise DownloadCancelled("Завантаження скасовано.")
 
                     if not chunk:
                         continue
 
-                    file.write(chunk)
+                    f.write(chunk)
                     done += len(chunk)
 
                     if progress_cb:
@@ -660,18 +654,14 @@ def stream_download(
 
         return str(filepath), title
 
-    except DownloadCancelled as error:
+    except DownloadCancelled as e:
         remove_file(filepath)
-        return None, str(error)
+        return None, str(e)
 
-    except Exception as error:
+    except Exception as e:
         remove_file(filepath)
-        return None, f"Помилка прямого завантаження: {error}"
+        return None, f"Помилка прямого завантаження: {e}"
 
-
-# ─────────────────────────────────────────────────────────────
-# YT-DLP OPTIONS
-# ─────────────────────────────────────────────────────────────
 
 def base_ytdlp_opts(
     platform: str | None,
@@ -679,14 +669,13 @@ def base_ytdlp_opts(
     quality: str,
     progress_hook=None,
 ) -> dict[str, Any]:
-    user_agent = (
+    ua = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
     )
 
     if platform == "tiktok":
-        user_agent = (
+        ua = (
             "com.zhiliaoapp.musically/2022600030 "
             "(Linux; U; Android 12; en_US; Pixel 6; Build/SP1A.210812.016)"
         )
@@ -705,7 +694,7 @@ def base_ytdlp_opts(
         "concurrent_fragment_downloads": 4,
         "http_chunk_size": 10 * 1024 * 1024,
         "http_headers": {
-            "User-Agent": user_agent,
+            "User-Agent": ua,
         },
         "progress_hooks": [progress_hook] if progress_hook else [],
     }
@@ -725,10 +714,10 @@ def base_ytdlp_opts(
             }
         ]
 
-    cookie_path = cookies_file()
+    ck = cookies_file()
 
-    if cookie_path:
-        opts["cookiefile"] = cookie_path
+    if ck:
+        opts["cookiefile"] = ck
 
     if platform == "youtube":
         opts["extractor_args"] = {
@@ -748,10 +737,6 @@ def base_ytdlp_opts(
     return opts
 
 
-# ─────────────────────────────────────────────────────────────
-# YT-DLP DOWNLOAD
-# ─────────────────────────────────────────────────────────────
-
 def download_via_ytdlp(
     url: str,
     platform: str | None,
@@ -762,18 +747,16 @@ def download_via_ytdlp(
 ):
     start = time.monotonic()
 
-    def hook(data: dict[str, Any]) -> None:
+    def hook(d: dict[str, Any]) -> None:
         if cancel_event and cancel_event.is_set():
             raise DownloadCancelled("Завантаження скасовано.")
 
         if not progress_cb:
             return
 
-        status = data.get("status")
-
-        if status == "downloading":
-            total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-            done = data.get("downloaded_bytes") or 0
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            done = d.get("downloaded_bytes") or 0
 
             progress_cb(
                 progress_text(
@@ -784,40 +767,43 @@ def download_via_ytdlp(
                 )
             )
 
-        elif status == "finished":
+        elif d.get("status") == "finished":
             progress_cb("🔧 Обробляю файл...")
 
-    opts = base_ytdlp_opts(platform, audio, quality, hook)
-
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            info = first_entry(info)
+        opts = base_ytdlp_opts(
+            platform,
+            audio,
+            quality,
+            hook,
+        )
 
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                url,
+                download=True,
+            )
+
+            info = first_entry(info)
             filepath = find_file(info, ydl)
 
             if audio and filepath:
-                mp3_path = str(Path(filepath).with_suffix(".mp3"))
+                mp3 = str(Path(filepath).with_suffix(".mp3"))
 
-                if Path(mp3_path).exists():
-                    filepath = mp3_path
+                if Path(mp3).exists():
+                    filepath = mp3
 
             if not filepath or not Path(filepath).exists():
                 return None, "Файл після завантаження не знайдено."
 
-            title = safe_text(info.get("title"), 180)
-            return filepath, title
+            return filepath, safe_text(info.get("title"), 180)
 
-    except DownloadCancelled as error:
-        return None, str(error)
+    except DownloadCancelled as e:
+        return None, str(e)
 
-    except Exception as error:
-        return None, friendly_error(platform, str(error))
+    except Exception as e:
+        return None, friendly_error(platform, str(e))
 
-
-# ─────────────────────────────────────────────────────────────
-# FALLBACK ДЛЯ TIKTOK
-# ─────────────────────────────────────────────────────────────
 
 def tiktok_fallback(
     url: str,
@@ -830,7 +816,7 @@ def tiktok_fallback(
     }
 
     try:
-        response = requests.get(
+        r = requests.get(
             "https://tikwm.com/api/",
             params={
                 "url": url,
@@ -840,8 +826,8 @@ def tiktok_fallback(
             timeout=REQUEST_TIMEOUT,
         )
 
-        response.raise_for_status()
-        data = response.json()
+        r.raise_for_status()
+        data = r.json()
 
         if data.get("code") != 0:
             return None, data.get("msg") or "tikwm.com не зміг отримати відео."
@@ -863,20 +849,16 @@ def tiktok_fallback(
             headers,
         )
 
-    except Exception as error:
-        return None, f"tikwm.com: {error}"
+    except Exception as e:
+        return None, f"tikwm.com: {e}"
 
-
-# ─────────────────────────────────────────────────────────────
-# FALLBACK ДЛЯ INSTAGRAM
-# ─────────────────────────────────────────────────────────────
 
 def instagram_fallback(
     url: str,
     progress_cb=None,
     cancel_event: Event | None = None,
 ):
-    fixed_url = (
+    fixed = (
         url
         .replace("www.instagram.com", "www.ddinstagram.com")
         .replace("instagram.com", "ddinstagram.com")
@@ -887,14 +869,14 @@ def instagram_fallback(
     }
 
     try:
-        response = requests.get(
-            fixed_url,
+        r = requests.get(
+            fixed,
             headers=headers,
             timeout=REQUEST_TIMEOUT,
         )
 
-        response.raise_for_status()
-        html = response.text
+        r.raise_for_status()
+
         video_url = None
 
         patterns = [
@@ -904,12 +886,12 @@ def instagram_fallback(
             r'"video_url":"([^"]+)"',
         ]
 
-        for pattern in patterns:
-            match = re.search(pattern, html)
+        for pat in patterns:
+            m = re.search(pat, r.text)
 
-            if match:
+            if m:
                 video_url = (
-                    match.group(1)
+                    m.group(1)
                     .replace("\\u0026", "&")
                     .replace("\\/", "/")
                 )
@@ -927,13 +909,9 @@ def instagram_fallback(
             headers,
         )
 
-    except Exception as error:
-        return None, f"Instagram fallback: {error}"
+    except Exception as e:
+        return None, f"Instagram fallback: {e}"
 
-
-# ─────────────────────────────────────────────────────────────
-# ПРЯМІ MP4/MOV/WEBM
-# ─────────────────────────────────────────────────────────────
 
 def download_direct(
     url: str,
@@ -953,10 +931,6 @@ def download_direct(
         cancel_event,
     )
 
-
-# ─────────────────────────────────────────────────────────────
-# ГОЛОВНА ФУНКЦІЯ ЗАВАНТАЖЕННЯ
-# ─────────────────────────────────────────────────────────────
 
 def download_media(
     url: str,
@@ -992,73 +966,77 @@ def download_media(
         if progress_cb:
             progress_cb("🔁 yt-dlp не зміг. Пробую TikTok fallback...")
 
-        path2, result2 = tiktok_fallback(
+        p2, r2 = tiktok_fallback(
             url,
             progress_cb,
             cancel_event,
         )
 
-        if path2:
-            return path2, result2
+        if p2:
+            return p2, r2
 
-        return None, f"{result}\n\nFallback TikTok: {result2}"
+        return None, f"{result}\n\nFallback TikTok: {r2}"
 
     if platform == "instagram":
         if progress_cb:
             progress_cb("🔁 yt-dlp не зміг. Пробую Instagram fallback...")
 
-        path2, result2 = instagram_fallback(
+        p2, r2 = instagram_fallback(
             url,
             progress_cb,
             cancel_event,
         )
 
-        if path2:
-            return path2, result2
+        if p2:
+            return p2, r2
 
-        return None, f"{result}\n\nFallback Instagram: {result2}"
+        return None, f"{result}\n\nFallback Instagram: {r2}"
 
     return None, result
 
-
-# ─────────────────────────────────────────────────────────────
-# INFO / FORMATS
-# ─────────────────────────────────────────────────────────────
 
 def extract_info_text(
     url: str,
     platform: str | None,
     quality: str,
 ) -> str:
-    opts = base_ytdlp_opts(platform, audio=False, quality=quality)
+    opts = base_ytdlp_opts(
+        platform,
+        audio=False,
+        quality=quality,
+    )
+
     opts["skip_download"] = True
 
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+        info = ydl.extract_info(
+            url,
+            download=False,
+        )
+
         info = first_entry(info)
 
-    title = safe_text(info.get("title"), 180)
-    uploader = safe_text(info.get("uploader") or info.get("channel") or "невідомо", 120)
-    duration = seconds_text(info.get("duration"))
-    views = info.get("view_count")
-    like_count = info.get("like_count")
-    webpage_url = info.get("webpage_url") or url
-
     lines = [
-        f"ℹ️ {title}",
-        f"Автор: {uploader}",
-        f"Тривалість: {duration}",
+        f"ℹ️ {safe_text(info.get('title'), 180)}",
+        f"Автор: {safe_text(info.get('uploader') or info.get('channel') or 'невідомо', 120)}",
+        f"Тривалість: {seconds_text(info.get('duration'))}",
     ]
 
-    if views is not None:
-        lines.append(f"Перегляди: {views:,}".replace(",", " "))
+    if info.get("view_count") is not None:
+        lines.append(
+            f"Перегляди: {info.get('view_count'):,}".replace(",", " ")
+        )
 
-    if like_count is not None:
-        lines.append(f"Лайки: {like_count:,}".replace(",", " "))
+    if info.get("like_count") is not None:
+        lines.append(
+            f"Лайки: {info.get('like_count'):,}".replace(",", " ")
+        )
 
-    lines.append(f"Платформа: {platform or 'unknown'}")
-    lines.append("")
-    lines.append(f"URL: {webpage_url}")
+    lines += [
+        f"Платформа: {platform or 'unknown'}",
+        "",
+        f"URL: {info.get('webpage_url') or url}",
+    ]
 
     return "\n".join(lines)[:3900]
 
@@ -1068,11 +1046,20 @@ def extract_formats_text(
     platform: str | None,
     quality: str,
 ) -> str:
-    opts = base_ytdlp_opts(platform, audio=False, quality=quality)
+    opts = base_ytdlp_opts(
+        platform,
+        audio=False,
+        quality=quality,
+    )
+
     opts["skip_download"] = True
 
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+        info = ydl.extract_info(
+            url,
+            download=False,
+        )
+
         info = first_entry(info)
 
     lines = [
@@ -1080,50 +1067,42 @@ def extract_formats_text(
         "",
     ]
 
-    count = 0
+    formats = info.get("formats") or []
 
-    for fmt in info.get("formats") or []:
-        if count >= 35:
+    for i, fmt in enumerate(formats):
+        if i >= 35:
             break
 
-        format_id = fmt.get("format_id", "?")
-        ext = fmt.get("ext", "?")
         height = fmt.get("height")
         fps = fmt.get("fps")
         size = fmt.get("filesize") or fmt.get("filesize_approx")
+        ext = fmt.get("ext", "?")
+        format_id = fmt.get("format_id", "?")
         note = fmt.get("format_note") or fmt.get("resolution") or "audio"
-        vcodec = fmt.get("vcodec")
-        acodec = fmt.get("acodec")
 
-        quality_label = f"{height}p" if height else note
+        label = f"{height}p" if height else note
 
         if fps:
-            quality_label += f"/{int(fps)}fps"
+            label += f"/{int(fps)}fps"
+
+        if fmt.get("vcodec") == "none":
+            media = "audio"
+        elif fmt.get("acodec") == "none":
+            media = "video-only"
+        else:
+            media = "video"
 
         size_text = f" ~{human_bytes(size)}" if size else ""
 
-        media_type = "video"
-
-        if vcodec == "none":
-            media_type = "audio"
-        elif acodec == "none":
-            media_type = "video-only"
-
         lines.append(
-            f"• {format_id}: {quality_label} ({ext}, {media_type}){size_text}"
+            f"• {format_id}: {label} ({ext}, {media}){size_text}"
         )
 
-        count += 1
-
-    if count == 0:
+    if len(lines) <= 2:
         lines.append("Формати не знайдено.")
 
     return "\n".join(lines)[:3900]
 
-
-# ─────────────────────────────────────────────────────────────
-# СТИСНЕННЯ ВІДЕО
-# ─────────────────────────────────────────────────────────────
 
 def compress_video(
     filepath: str,
@@ -1132,14 +1111,14 @@ def compress_video(
     if not FFMPEG_PATH:
         return None
 
-    source = Path(filepath)
-    target = source.with_name(source.stem + "_compressed.mp4")
+    src = Path(filepath)
+    dst = src.with_name(src.stem + "_compressed.mp4")
 
     cmd = [
         FFMPEG_PATH,
         "-y",
         "-i",
-        str(source),
+        str(src),
         "-vf",
         "scale=720:-2:force_original_aspect_ratio=decrease",
         "-c:v",
@@ -1154,7 +1133,7 @@ def compress_video(
         "96k",
         "-movflags",
         "+faststart",
-        str(target),
+        str(dst),
     ]
 
     try:
@@ -1169,35 +1148,28 @@ def compress_video(
             timeout=420,
         )
 
-        if target.exists() and target.stat().st_size < source.stat().st_size:
-            return str(target)
+        if dst.exists() and dst.stat().st_size < src.stat().st_size:
+            return str(dst)
 
     except Exception:
-        logger.exception("Не вдалося стиснути відео")
+        return None
 
     return None
 
 
-# ─────────────────────────────────────────────────────────────
-# TELEGRAM HELPERS
-# ─────────────────────────────────────────────────────────────
-
-async def safe_edit(
-    message,
-    text: str,
-) -> None:
+async def safe_edit(message, text: str) -> None:
     try:
         await message.edit_text(text[:3900])
 
-    except RetryAfter as error:
-        await asyncio.sleep(float(error.retry_after) + 0.2)
+    except RetryAfter as e:
+        await asyncio.sleep(float(e.retry_after) + 0.2)
 
-    except BadRequest as error:
-        if "message is not modified" not in str(error).lower():
-            logger.debug("edit_text error: %s", error)
+    except BadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            logger.debug("edit_text error: %s", e)
 
-    except TelegramError as error:
-        logger.debug("Telegram error: %s", error)
+    except TelegramError as e:
+        logger.debug("telegram error: %s", e)
 
 
 async def send_media(
@@ -1207,15 +1179,14 @@ async def send_media(
     is_audio: bool = False,
     progress_cb=None,
 ) -> int:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message:
+    if not msg:
         remove_file(filepath)
         return 0
 
-    files_to_delete = {filepath}
+    delete_later = {filepath}
     final_path = filepath
-    sent_size = 0
 
     try:
         size = Path(final_path).stat().st_size
@@ -1227,13 +1198,13 @@ async def send_media(
             )
 
             if compressed:
-                files_to_delete.add(compressed)
+                delete_later.add(compressed)
                 final_path = compressed
                 size = Path(final_path).stat().st_size
 
         if size > MAX_UPLOAD_BYTES:
-            await message.reply_text(
-                "❌ Файл більший за ліміт Telegram Bot API.\n"
+            await msg.reply_text(
+                "❌ Файл більший за ліміт Telegram Bot API. "
                 "Постав /quality fast або /quality mobile і спробуй ще раз."
             )
             return 0
@@ -1241,10 +1212,10 @@ async def send_media(
         if progress_cb:
             progress_cb("📤 Надсилаю файл у Telegram...")
 
-        with open(final_path, "rb") as file:
+        with open(final_path, "rb") as f:
             if is_audio:
-                await message.reply_audio(
-                    audio=file,
+                await msg.reply_audio(
+                    audio=f,
                     title=title[:64],
                     caption=f"🎵 {title[:180]}",
                     read_timeout=180,
@@ -1253,8 +1224,8 @@ async def send_media(
                     pool_timeout=60,
                 )
             else:
-                await message.reply_video(
-                    video=file,
+                await msg.reply_video(
+                    video=f,
                     caption=f"✅ {title[:200]}",
                     supports_streaming=True,
                     read_timeout=180,
@@ -1263,22 +1234,17 @@ async def send_media(
                     pool_timeout=60,
                 )
 
-        sent_size = size
-        return sent_size
+        return size
 
     except Exception:
         logger.exception("Помилка надсилання")
-        await message.reply_text("❌ Не вдалося надіслати файл у Telegram.")
+        await msg.reply_text("❌ Не вдалося надіслати файл у Telegram.")
         return 0
 
     finally:
-        for path in files_to_delete:
-            remove_file(path)
+        for p in delete_later:
+            remove_file(p)
 
-
-# ─────────────────────────────────────────────────────────────
-# ОСНОВНА ЛОГІКА
-# ─────────────────────────────────────────────────────────────
 
 async def download_and_send(
     update: Update,
@@ -1286,18 +1252,18 @@ async def download_and_send(
     platform: str,
     audio: bool = False,
 ) -> None:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message:
+    if not msg:
         return
 
-    current_chat_id = chat_id(update)
-    quality = quality_for(current_chat_id)
+    cid = chat_id(update)
+    quality = quality_for(cid)
     cancel_event = Event()
 
-    CANCEL_EVENTS[current_chat_id] = cancel_event
+    CANCEL_EVENTS[cid] = cancel_event
 
-    ACTIVE_TASKS[current_chat_id] = {
+    ACTIVE_TASKS[cid] = {
         "url": url,
         "platform": platform,
         "audio": audio,
@@ -1306,7 +1272,7 @@ async def download_and_send(
     }
 
     async with PARALLEL_LIMIT:
-        status = await message.reply_text(
+        status = await msg.reply_text(
             "🎵 Готую аудіо..." if audio else "⏳ Починаю завантаження..."
         )
 
@@ -1358,7 +1324,7 @@ async def download_and_send(
                 "✅ Завантажено. Готую відправку...",
             )
 
-            sent_size = await send_media(
+            sent = await send_media(
                 update,
                 path,
                 title,
@@ -1366,8 +1332,8 @@ async def download_and_send(
                 progress_cb=progress_cb,
             )
 
-            if sent_size:
-                stats.ok(platform, sent_size)
+            if sent:
+                stats.ok(platform, sent)
 
             try:
                 await status.delete()
@@ -1375,8 +1341,8 @@ async def download_and_send(
                 pass
 
         finally:
-            CANCEL_EVENTS.pop(current_chat_id, None)
-            ACTIVE_TASKS.pop(current_chat_id, None)
+            CANCEL_EVENTS.pop(cid, None)
+            ACTIVE_TASKS.pop(cid, None)
             clean_old_files(False)
 
 
@@ -1384,19 +1350,19 @@ async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message or not message.text:
+    if not msg or not msg.text:
         return
 
-    urls = extract_urls(message.text)
+    urls = extract_urls(msg.text)
 
     if not urls:
-        await message.reply_text("❌ Надішли посилання на відео.")
+        await msg.reply_text("❌ Надішли посилання на відео.")
         return
 
     if len(urls) > 1:
-        await message.reply_text(
+        await msg.reply_text(
             f"Знайшов {len(urls)} посилання. Оброблю по черзі."
         )
 
@@ -1404,7 +1370,7 @@ async def handle_message(
         platform = "direct" if DIRECT_VIDEO_RE.search(url) else detect_platform(url)
 
         if not platform:
-            await message.reply_text(
+            await msg.reply_text(
                 f"❌ Платформа не підтримується:\n{url}"
             )
             continue
@@ -1416,10 +1382,6 @@ async def handle_message(
             audio=False,
         )
 
-
-# ─────────────────────────────────────────────────────────────
-# КОМАНДИ
-# ─────────────────────────────────────────────────────────────
 
 async def start_command(
     update: Update,
@@ -1433,25 +1395,25 @@ async def video_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message:
+    if not msg:
         return
 
     url = context.args[0].strip() if context.args else None
 
-    if not url and message.reply_to_message and message.reply_to_message.text:
-        found = extract_urls(message.reply_to_message.text)
+    if not url and msg.reply_to_message and msg.reply_to_message.text:
+        found = extract_urls(msg.reply_to_message.text)
         url = found[0] if found else None
 
     if not url:
-        await message.reply_text("❌ Використання: /video <посилання>")
+        await msg.reply_text("❌ Використання: /video <посилання>")
         return
 
     platform = "direct" if DIRECT_VIDEO_RE.search(url) else detect_platform(url)
 
     if not platform:
-        await message.reply_text("❌ Платформа не підтримується.")
+        await msg.reply_text("❌ Платформа не підтримується.")
         return
 
     await download_and_send(
@@ -1466,19 +1428,19 @@ async def audio_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message:
+    if not msg:
         return
 
     url = context.args[0].strip() if context.args else None
 
-    if not url and message.reply_to_message and message.reply_to_message.text:
-        found = extract_urls(message.reply_to_message.text)
+    if not url and msg.reply_to_message and msg.reply_to_message.text:
+        found = extract_urls(msg.reply_to_message.text)
         url = found[0] if found else None
 
     if not url:
-        await message.reply_text(
+        await msg.reply_text(
             "❌ Використання: /audio <посилання> або /audio у відповідь на посилання."
         )
         return
@@ -1486,7 +1448,7 @@ async def audio_command(
     platform = detect_platform(url)
 
     if not platform:
-        await message.reply_text("❌ Платформа не підтримується для аудіо.")
+        await msg.reply_text("❌ Платформа не підтримується для аудіо.")
         return
 
     await download_and_send(
@@ -1501,36 +1463,35 @@ async def info_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message:
+    if not msg:
         return
 
     url = context.args[0].strip() if context.args else None
 
-    if not url and message.reply_to_message and message.reply_to_message.text:
-        found = extract_urls(message.reply_to_message.text)
+    if not url and msg.reply_to_message and msg.reply_to_message.text:
+        found = extract_urls(msg.reply_to_message.text)
         url = found[0] if found else None
 
     if not url:
-        await message.reply_text("❌ Використання: /info <посилання>")
+        await msg.reply_text("❌ Використання: /info <посилання>")
         return
 
     if DIRECT_VIDEO_RE.search(url):
-        await message.reply_text("ℹ️ Це пряме посилання на файл. Для нього /info не потрібна.")
+        await msg.reply_text("ℹ️ Це пряме посилання на файл. Для нього /info не потрібна.")
         return
 
     platform = detect_platform(url)
 
     if not platform:
-        await message.reply_text("❌ Платформа не підтримується.")
+        await msg.reply_text("❌ Платформа не підтримується.")
         return
 
-    status = await message.reply_text("🔎 Отримую інформацію...")
-    loop = asyncio.get_running_loop()
+    status = await msg.reply_text("🔎 Отримую інформацію...")
 
     try:
-        result = await loop.run_in_executor(
+        result = await asyncio.get_running_loop().run_in_executor(
             None,
             partial(
                 extract_info_text,
@@ -1542,10 +1503,10 @@ async def info_command(
 
         await safe_edit(status, result)
 
-    except Exception as error:
+    except Exception as e:
         await safe_edit(
             status,
-            f"❌ {friendly_error(platform, str(error))}",
+            f"❌ {friendly_error(platform, str(e))}",
         )
 
 
@@ -1553,32 +1514,31 @@ async def formats_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message:
+    if not msg:
         return
 
     url = context.args[0].strip() if context.args else None
 
-    if not url and message.reply_to_message and message.reply_to_message.text:
-        found = extract_urls(message.reply_to_message.text)
+    if not url and msg.reply_to_message and msg.reply_to_message.text:
+        found = extract_urls(msg.reply_to_message.text)
         url = found[0] if found else None
 
     if not url:
-        await message.reply_text("❌ Використання: /formats <посилання>")
+        await msg.reply_text("❌ Використання: /formats <посилання>")
         return
 
     platform = detect_platform(url)
 
     if not platform:
-        await message.reply_text("❌ Платформа не підтримується.")
+        await msg.reply_text("❌ Платформа не підтримується.")
         return
 
-    status = await message.reply_text("🔎 Отримую формати...")
-    loop = asyncio.get_running_loop()
+    status = await msg.reply_text("🔎 Отримую формати...")
 
     try:
-        result = await loop.run_in_executor(
+        result = await asyncio.get_running_loop().run_in_executor(
             None,
             partial(
                 extract_formats_text,
@@ -1590,10 +1550,10 @@ async def formats_command(
 
         await safe_edit(status, result)
 
-    except Exception as error:
+    except Exception as e:
         await safe_edit(
             status,
-            f"❌ {friendly_error(platform, str(error))}",
+            f"❌ {friendly_error(platform, str(e))}",
         )
 
 
@@ -1611,7 +1571,7 @@ async def platforms_command(
 ) -> None:
     if update.effective_message:
         await update.effective_message.reply_text(
-            "Підтримую:\n" + "\n".join(f"• {platform}" for platform in URL_PATTERNS)
+            "Підтримую:\n" + "\n".join(f"• {p}" for p in URL_PATTERNS)
         )
 
 
@@ -1619,43 +1579,41 @@ async def quality_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message:
+    if not msg:
         return
 
-    current_chat_id = chat_id(update)
+    cid = chat_id(update)
 
     if not context.args:
-        await message.reply_text(
-            f"Поточна якість: {quality_for(current_chat_id)}\n"
-            "/quality best — найкраща якість\n"
-            "/quality fast — швидше, до 720p\n"
-            "/quality mobile — легший файл, до 480p"
+        await msg.reply_text(
+            f"Поточна якість: {quality_for(cid)}\n"
+            "/quality best — найкраща\n"
+            "/quality fast — до 720p\n"
+            "/quality mobile — до 480p"
         )
         return
 
     value = context.args[0].lower().strip()
 
     if value not in {"best", "fast", "mobile"}:
-        await message.reply_text("❌ Доступно тільки: best, fast, mobile")
+        await msg.reply_text("❌ Доступно тільки: best, fast, mobile")
         return
 
-    USER_QUALITY[current_chat_id] = value
+    USER_QUALITY[cid] = value
     save_settings()
 
-    await message.reply_text(f"✅ Якість змінено на: {value}")
+    await msg.reply_text(f"✅ Якість змінено на: {value}")
 
 
 async def clean_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    removed = clean_old_files(True)
-
     if update.effective_message:
         await update.effective_message.reply_text(
-            f"🧹 Видалено файлів: {removed}"
+            f"🧹 Видалено файлів: {clean_old_files(True)}"
         )
 
 
@@ -1663,45 +1621,43 @@ async def cancel_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message:
+    if not msg:
         return
 
     event = CANCEL_EVENTS.get(chat_id(update))
 
     if not event:
-        await message.reply_text("Немає активного завантаження для скасування.")
+        await msg.reply_text("Немає активного завантаження для скасування.")
         return
 
     event.set()
 
-    await message.reply_text("🛑 Скасовую завантаження...")
+    await msg.reply_text("🛑 Скасовую завантаження...")
 
 
 async def queue_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message:
+    if not msg:
         return
 
     task = ACTIVE_TASKS.get(chat_id(update))
 
     if not task:
-        await message.reply_text("Активного завантаження в цьому чаті немає.")
+        await msg.reply_text("Активного завантаження в цьому чаті немає.")
         return
 
-    elapsed = seconds_text(time.time() - task["started_at"])
-
-    await message.reply_text(
+    await msg.reply_text(
         "⏳ Активне завантаження:\n"
         f"Платформа: {task['platform']}\n"
         f"Тип: {'audio' if task['audio'] else 'video'}\n"
         f"Якість: {task['quality']}\n"
-        f"Час: {elapsed}\n"
+        f"Час: {seconds_text(time.time() - task['started_at'])}\n"
         f"URL: {task['url'][:300]}"
     )
 
@@ -1710,27 +1666,25 @@ async def cookies_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message:
+    if not msg:
         return
 
     path = cookies_file()
 
     if not path:
-        await message.reply_text(
-            "❌ cookies.txt не знайдено або формат неправильний.\n\n"
+        await msg.reply_text(
+            "❌ cookies.txt не знайдено або формат неправильний.\n"
             "Правильний перший рядок:\n"
             "# Netscape HTTP Cookie File"
         )
         return
 
-    size = Path(path).stat().st_size
-
-    await message.reply_text(
-        "✅ cookies.txt знайдено\n"
+    await msg.reply_text(
+        f"✅ cookies.txt знайдено\n"
         f"Шлях: {path}\n"
-        f"Розмір: {human_bytes(size)}"
+        f"Розмір: {human_bytes(Path(path).stat().st_size)}"
     )
 
 
@@ -1738,25 +1692,24 @@ async def health_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    message = update.effective_message
+    msg = update.effective_message
 
-    if not message:
+    if not msg:
         return
 
-    cookie_path = cookies_file()
-    files_count = len(list(DOWNLOAD_DIR.glob("*")))
+    ck = cookies_file()
 
     lines = [
         "🩺 Health check",
         f"ffmpeg: {'✅ ' + FFMPEG_PATH if FFMPEG_PATH else '❌ не знайдено'}",
-        f"cookies.txt: {'✅ ' + cookie_path if cookie_path else '❌ не знайдено'}",
-        f"downloads/: {files_count} файлів",
+        f"cookies.txt: {'✅ ' + ck if ck else '❌ не знайдено'}",
+        f"downloads/: {len(list(DOWNLOAD_DIR.glob('*')))} файлів",
         f"parallel: {PARALLEL_DOWNLOADS}",
         f"max upload: {human_bytes(MAX_UPLOAD_BYTES)}",
         f"quality: {quality_for(chat_id(update))}",
     ]
 
-    await message.reply_text("\n".join(lines))
+    await msg.reply_text("\n".join(lines))
 
 
 async def reset_stats_command(
@@ -1781,10 +1734,6 @@ async def error_handler(
         exc_info=context.error,
     )
 
-
-# ─────────────────────────────────────────────────────────────
-# ЗАПУСК
-# ─────────────────────────────────────────────────────────────
 
 def delete_webhook() -> None:
     try:
