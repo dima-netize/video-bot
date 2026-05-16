@@ -73,6 +73,7 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 STATS_FILE = BASE_DIR / "bot_stats.json"
 SETTINGS_FILE = BASE_DIR / "bot_settings.json"
+SUBSCRIBERS_FILE = BASE_DIR / "bot_subscribers.json"
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(49 * 1024 * 1024)))
 PROGRESS_THROTTLE = float(os.environ.get("PROGRESS_THROTTLE", "1.3"))
@@ -121,6 +122,11 @@ HELP_TEXT = """🎥 Fast Video Downloader Bot
 /queue — активне завантаження
 /cancel — скасувати активне завантаження
 /clean — очистити старі файли
+/settings — поточні налаштування
+/howto — як користуватися ботом
+/announce <текст> — розсилка (тільки адмін)
+/subscribers — скільки чатів підписано (адмін)
+/shutdown — зупинити бота (тільки адмін)
 /platforms — платформи
 /updateytdlp — оновити yt-dlp
 /resetstats — очистити статистику
@@ -130,6 +136,8 @@ YouTube на free-серверах часто просить cookies.txt. Це �
 
 CANCEL_EVENTS: dict[int, Event] = {}
 ACTIVE_TASKS: dict[int, dict[str, Any]] = {}
+BOT_STARTED_AT = time.time()
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "dimagymenjuk").lower().lstrip("@")
 
 class DownloadCancelled(Exception):
     pass
@@ -150,12 +158,30 @@ def write_json(path: Path, data: Any) -> None:
 
 STATS = read_json(STATS_FILE, {"success": 0, "errors": 0, "bytes": 0, "platforms": {}})
 SETTINGS = read_json(SETTINGS_FILE, {"quality": {}})
+SUBSCRIBERS = set(int(x) for x in read_json(SUBSCRIBERS_FILE, []))
 
 def save_stats() -> None:
     write_json(STATS_FILE, STATS)
 
 def save_settings() -> None:
     write_json(SETTINGS_FILE, SETTINGS)
+
+def save_subscribers() -> None:
+    write_json(SUBSCRIBERS_FILE, sorted(SUBSCRIBERS))
+
+def is_admin(update: Update) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    return (user.username or "").lower() == ADMIN_USERNAME
+
+def register_chat(update: Update) -> None:
+    cid = chat_id(update)
+    if not cid:
+        return
+    if cid not in SUBSCRIBERS:
+        SUBSCRIBERS.add(cid)
+        save_subscribers()
 
 def stats_ok(platform: str, size: int) -> None:
     STATS["success"] = int(STATS.get("success", 0)) + 1
@@ -216,6 +242,16 @@ def extract_urls(text: str) -> list[str]:
         if url and url not in out:
             out.append(url)
     return out[:MAX_LINKS_PER_MESSAGE]
+
+def normalize_url(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    value = raw.strip().strip("<>()[]{}.,;\"' ")
+    if not value:
+        return None
+    if not re.match(r"^https?://", value, re.I):
+        return None
+    return value
 
 def detect_platform(url: str) -> str | None:
     for name, pat in URL_PATTERNS.items():
@@ -582,6 +618,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     msg = update.effective_message
     if not msg or not msg.text:
         return
+    register_chat(update)
     urls = extract_urls(msg.text)
     if not urls:
         await msg.reply_text("❌ Надішли посилання на відео.")
@@ -597,16 +634,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
+        register_chat(update)
         await update.effective_message.reply_text(HELP_TEXT)
 
 async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
         return
-    url = context.args[0].strip() if context.args else None
+    register_chat(update)
+    url = normalize_url(context.args[0]) if context.args else None
     if not url and msg.reply_to_message and msg.reply_to_message.text:
         found = extract_urls(msg.reply_to_message.text)
-        url = found[0] if found else None
+        url = normalize_url(found[0]) if found else None
     if not url:
         await msg.reply_text("❌ Використання: /video <посилання>")
         return
@@ -620,10 +659,11 @@ async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     msg = update.effective_message
     if not msg:
         return
-    url = context.args[0].strip() if context.args else None
+    register_chat(update)
+    url = normalize_url(context.args[0]) if context.args else None
     if not url and msg.reply_to_message and msg.reply_to_message.text:
         found = extract_urls(msg.reply_to_message.text)
-        url = found[0] if found else None
+        url = normalize_url(found[0]) if found else None
     if not url:
         await msg.reply_text("❌ Використання: /audio <посилання> або /audio у відповідь на посилання.")
         return
@@ -643,10 +683,10 @@ async def info_or_formats(update: Update, context: ContextTypes.DEFAULT_TYPE, mo
     msg = update.effective_message
     if not msg:
         return
-    url = context.args[0].strip() if context.args else None
+    url = normalize_url(context.args[0]) if context.args else None
     if not url and msg.reply_to_message and msg.reply_to_message.text:
         found = extract_urls(msg.reply_to_message.text)
-        url = found[0] if found else None
+        url = normalize_url(found[0]) if found else None
     if not url:
         await msg.reply_text(f"❌ Використання: /{mode} <посилання>")
         return
@@ -747,7 +787,36 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"downloads/: {len(list(DOWNLOAD_DIR.glob('*')))} файлів\n"
         f"parallel: {PARALLEL_DOWNLOADS}\n"
         f"max upload: {human_bytes(MAX_UPLOAD_BYTES)}\n"
-        f"quality: {quality_for(chat_id(update))}"
+        f"quality: {quality_for(chat_id(update))}\n"
+        f"uptime: {seconds_text(time.time() - BOT_STARTED_AT)}"
+    )
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    register_chat(update)
+    await msg.reply_text(
+        "⚙️ Поточні налаштування:\n"
+        f"Якість: {quality_for(chat_id(update))}\n"
+        f"Паралельних завантажень: {PARALLEL_DOWNLOADS}\n"
+        f"Ліміт файлу: {human_bytes(MAX_UPLOAD_BYTES)}\n"
+        f"Throttle прогресу: {PROGRESS_THROTTLE:.1f}с\n"
+        f"TTL старих файлів: {seconds_text(OLD_FILE_TTL)}"
+    )
+
+async def howto_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    register_chat(update)
+    await msg.reply_text(
+        "🧭 Як користуватись:\n"
+        "1) Надішли посилання — бот сам спробує скачати відео.\n"
+        "2) Для аудіо: /audio <посилання>.\n"
+        "3) Якщо файл завеликий: /quality fast або /quality mobile.\n"
+        "4) Якщо YouTube не качається — перевір /cookies.\n"
+        "5) Для діагностики: /health, /settings, /queue, /cancel."
     )
 
 async def platforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -760,6 +829,49 @@ async def reset_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     save_stats()
     if update.effective_message:
         await update.effective_message.reply_text("✅ Статистику очищено.")
+
+async def announce_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    register_chat(update)
+    if not is_admin(update):
+        await msg.reply_text("⛔ Ця команда тільки для власника бота.")
+        return
+    text = " ".join(context.args).strip() if context.args else ""
+    if not text and msg.reply_to_message and msg.reply_to_message.text:
+        text = msg.reply_to_message.text.strip()
+    if not text:
+        await msg.reply_text("❌ Використання: /announce <текст> або у відповідь на повідомлення.")
+        return
+    sent = 0
+    failed = 0
+    for cid in sorted(SUBSCRIBERS):
+        try:
+            await context.bot.send_message(chat_id=cid, text=f"📢 Оголошення від @dimagymenjuk\n\n{text[:3800]}")
+            sent += 1
+        except Exception:
+            failed += 1
+    await msg.reply_text(f"✅ Розіслано: {sent}\n❌ Помилок: {failed}\n👥 Всього підписників: {len(SUBSCRIBERS)}")
+
+async def subscribers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    if not is_admin(update):
+        await msg.reply_text("⛔ Ця команда тільки для власника бота.")
+        return
+    await msg.reply_text(f"👥 Підписано чатів: {len(SUBSCRIBERS)}")
+
+async def shutdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    if not is_admin(update):
+        await msg.reply_text("⛔ Ця команда тільки для власника бота.")
+        return
+    await msg.reply_text("🛑 Зупиняю бота...")
+    context.application.stop_running()
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
@@ -808,6 +920,11 @@ def main() -> None:
     app.add_handler(CommandHandler("queue", queue_command))
     app.add_handler(CommandHandler("cookies", cookies_command))
     app.add_handler(CommandHandler("health", health_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("howto", howto_command))
+    app.add_handler(CommandHandler("announce", announce_command))
+    app.add_handler(CommandHandler("subscribers", subscribers_command))
+    app.add_handler(CommandHandler("shutdown", shutdown_command))
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("updateytdlp", update_ytdlp_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
