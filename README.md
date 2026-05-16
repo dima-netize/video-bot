@@ -20,6 +20,34 @@ sudo bash deploy/bootstrap_vps.sh <BOT_TOKEN> dimagymenjuk <PANEL_TOKEN> <PANEL_
 ```
 Після завершення скрипт покаже URL твого сайту.
 
+
+## 0.1) Повністю власний VPS + власний IP (автоматично)
+Якщо ти хочеш, щоб скрипт **сам створив новий VPS і новий публічний IP**, використай Hetzner Cloud API:
+
+1. Створи API token у Hetzner Cloud (`Project -> Security -> API Tokens`).
+2. Підготуй SSH public key на своєму ПК/ноуті (`~/.ssh/id_ed25519.pub` або `~/.ssh/id_rsa.pub`).
+3. Запусти:
+
+```bash
+HCLOUD_TOKEN=<ТВІЙ_HCLOUD_TOKEN> bash deploy/create_vps_hcloud.sh \
+  --name video-bot-ua \
+  --location fsn1 \
+  --type cpx21 \
+  --image ubuntu-24.04 \
+  --ssh-key ~/.ssh/id_ed25519.pub \
+  --repo <YOUR_REPO_URL> \
+  --bot-token <BOT_TOKEN> \
+  --admin-username dimagymenjuk \
+  --panel-token <PANEL_TOKEN> \
+  --panel-secret <PANEL_SECRET>
+```
+
+Після завершення скрипт виведе:
+- `VPS IP: ...`
+- `Сайт: http://...`
+
+> Важливо: “власний VPS і IP” завжди видає провайдер (Hetzner/Contabo/DO). Сам код не "генерує" IP, а автоматизує його створення через API.
+
 ## 1) Підготовка VPS
 Рекомендовано: Ubuntu 22.04+, 2 vCPU, 4GB RAM.
 
