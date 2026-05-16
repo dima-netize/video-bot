@@ -1,0 +1,39 @@
+services:
+  video-bot:
+    build: .
+    container_name: video-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
+      - ./bot_stats.json:/app/bot_stats.json
+      - ./bot_settings.json:/app/bot_settings.json
+      - ./bot_subscribers.json:/app/bot_subscribers.json
+      - ./cookies.txt:/app/cookies.txt
+
+  control-panel:
+    build: .
+    container_name: video-bot-panel
+    restart: unless-stopped
+    command: python admin_site.py
+    env_file:
+      - .env
+    expose:
+      - "8080"
+    volumes:
+      - ./downloads:/app/downloads
+      - ./bot_stats.json:/app/bot_stats.json
+      - ./bot_settings.json:/app/bot_settings.json
+      - ./bot_subscribers.json:/app/bot_subscribers.json
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: video-bot-nginx
+    depends_on:
+      - control-panel
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./deploy/nginx/video-bot.conf:/etc/nginx/conf.d/default.conf:ro
