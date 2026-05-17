@@ -111,6 +111,7 @@ SETTINGS_FILE = BASE_DIR / "bot_settings.json"
 USERS_FILE    = BASE_DIR / "bot_users.json"
 BANS_FILE     = BASE_DIR / "bot_bans.json"
 HISTORY_FILE  = BASE_DIR / "bot_history.json"
+OWNER_ID_FILE = BASE_DIR / "bot_owner_id.json"
 
 MAX_UPLOAD_BYTES    = int(os.environ.get("MAX_UPLOAD_BYTES",     str(49 * 1024 * 1024)))
 PROGRESS_THROTTLE   = float(os.environ.get("PROGRESS_THROTTLE",  "1.5"))
@@ -206,6 +207,8 @@ HELP_TEXT = """🎥 *Fast Video Downloader Bot*
 /ban `<id>` — заблокувати
 /unban `<id>` — розблокувати
 /resetstats — очистити статистику
+/adminstats — аналітика користувачів
+/userlimit <n|off> — ліміт юзерів
 
 _💡 Підказка: YouTube часто потребує cookies.txt на free-серверах._
 """
@@ -245,6 +248,7 @@ SETTINGS = read_json(SETTINGS_FILE, {"quality": {}})
 USERS    = read_json(USERS_FILE,    {})
 BANNED_USERS: set[int] = set(read_json(BANS_FILE, []))
 HISTORY: dict[str, list[dict]] = read_json(HISTORY_FILE, {})  # {uid_str: [{url, title, ts, platform}]}
+OWNER_ID: int | None = read_json(OWNER_ID_FILE, None)
 
 
 def save_stats()    -> None: write_json(STATS_FILE,    STATS)
@@ -252,6 +256,7 @@ def save_settings() -> None: write_json(SETTINGS_FILE, SETTINGS)
 def save_users()    -> None: write_json(USERS_FILE,    USERS)
 def save_bans()     -> None: write_json(BANS_FILE,     list(BANNED_USERS))
 def save_history()  -> None: write_json(HISTORY_FILE,  HISTORY)
+def save_owner_id() -> None: write_json(OWNER_ID_FILE, OWNER_ID)
 
 
 def record_user(update: Update) -> None:
@@ -1019,6 +1024,23 @@ def settings_keyboard(cid: int) -> InlineKeyboardMarkup:
     ])
 
 
+def user_limit() -> int:
+    raw = SETTINGS.get("limits", {}).get("max_users", 0)
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 0
+
+
+def user_allowed(uid: int) -> bool:
+    if uid in ADMIN_IDS:
+        return True
+    limit = user_limit()
+    if not limit:
+        return True
+    return str(uid) in USERS or len(USERS) < limit
+
+
 # ─────────────────────────── Core flow ────────────────────────
 async def download_and_send(
     update: Update,
@@ -1036,6 +1058,9 @@ async def download_and_send(
 
     if uid in BANNED_USERS:
         await msg.reply_text("🚫 Ти заблокований у цьому боті.")
+        return
+    if not user_allowed(uid):
+        await msg.reply_text("⛔ Бот тимчасово закритий для нових користувачів.")
         return
 
     if not check_rate_limit(uid):
@@ -1607,11 +1632,19 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # ─────────────────────────── Admin ────────────────────────────
 def sync_owner_id(update: Update) -> None:
+    global OWNER_ID
     user = update.effective_user
     if not user or not user.username:
         return
-    if user.username.lower() == ADMIN_USERNAME:
-        ADMIN_IDS.add(int(user.id))
+    uname = user.username.lower()
+    uid = int(user.id)
+    if uname != ADMIN_USERNAME:
+        return
+    if OWNER_ID is None:
+        OWNER_ID = uid
+        save_owner_id()
+    if uid == OWNER_ID:
+        ADMIN_IDS.add(uid)
 
 
 def require_admin(func):
@@ -1619,7 +1652,7 @@ def require_admin(func):
         sync_owner_id(update)
         uid = user_id(update)
         uname = (update.effective_user.username or "").lower() if update.effective_user else ""
-        if uid not in ADMIN_IDS or uname != ADMIN_USERNAME:
+        if uid not in ADMIN_IDS or uname != ADMIN_USERNAME or (OWNER_ID is not None and uid != OWNER_ID):
             if update.effective_message:
                 await update.effective_message.reply_text("🚫 Тільки для адмінів.")
             return
@@ -1696,6 +1729,55 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await msg.reply_text(f"✅ Юзер {uid} розблокований.")
 
 
+
+
+@require_admin
+async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    now = datetime.utcnow()
+    recent = 0
+    for u in USERS.values():
+        try:
+            if now - datetime.fromisoformat(u.get("joined", "")) <= timedelta(hours=24):
+                recent += 1
+        except Exception:
+            pass
+    limit = user_limit()
+    txt = (
+        f"👑 Власник: {OWNER_HANDLE}\n"
+        f"🆔 Owner ID: `{OWNER_ID or 'ще не зафіксовано'}`\n"
+        f"👥 Користувачів: {len(USERS)}\n"
+        f"🕒 Нових за 24г: {recent}\n"
+        f"🚫 Заблокованих: {len(BANNED_USERS)}\n"
+        f"🎚 Ліміт юзерів: {'off' if limit == 0 else limit}"
+    )
+    await msg.reply_text(txt, parse_mode="Markdown")
+
+
+@require_admin
+async def user_limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    if not context.args:
+        current = user_limit()
+        await msg.reply_text(f"Поточний ліміт: {'off' if current == 0 else current}")
+        return
+    arg = context.args[0].lower()
+    if arg == 'off':
+        value = 0
+    elif arg.isdigit():
+        value = max(0, int(arg))
+    else:
+        await msg.reply_text("❌ Використання: /userlimit <n|off>")
+        return
+    SETTINGS.setdefault("limits", {})["max_users"] = value
+    save_settings()
+    await msg.reply_text(f"✅ Ліміт юзерів: {'off' if value == 0 else value}")
+
+
 # ─────────────────────────── Error handler ────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Unhandled error:", exc_info=context.error)
@@ -1747,6 +1829,8 @@ def main() -> None:
     app.add_handler(CommandHandler("users",       users_command))
     app.add_handler(CommandHandler("ban",         ban_command))
     app.add_handler(CommandHandler("unban",       unban_command))
+    app.add_handler(CommandHandler("adminstats",  admin_stats_command))
+    app.add_handler(CommandHandler("userlimit",   user_limit_command))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(quality_callback,  pattern=r"^quality:"))
