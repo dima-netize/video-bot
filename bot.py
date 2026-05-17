@@ -98,8 +98,9 @@ if not TOKEN:
 # Якщо не задано — бот запускається в polling режимі (для локальної розробки)
 WEBHOOK_URL: str | None = os.environ.get("WEBHOOK_URL", "").rstrip("/") or None
 
-_admin_env = os.environ.get("ADMIN_IDS", "")
-ADMIN_IDS: set[int] = {int(x.strip()) for x in _admin_env.split(",") if x.strip().isdigit()}
+ADMIN_USERNAME = "dimagymenjuk"
+OWNER_HANDLE = f"@{ADMIN_USERNAME}"
+ADMIN_IDS: set[int] = set()  # Динамічно фіксуємо ID власника за username
 
 BASE_DIR     = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
@@ -200,6 +201,7 @@ HELP_TEXT = """🎥 *Fast Video Downloader Bot*
 
 *🔐 Адмін:*
 /broadcast `<текст>` — надіслати всім
+/ad `<текст>` — реклама для всіх
 /users — список юзерів
 /ban `<id>` — заблокувати
 /unban `<id>` — розблокувати
@@ -1604,10 +1606,20 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ─────────────────────────── Admin ────────────────────────────
+def sync_owner_id(update: Update) -> None:
+    user = update.effective_user
+    if not user or not user.username:
+        return
+    if user.username.lower() == ADMIN_USERNAME:
+        ADMIN_IDS.add(int(user.id))
+
+
 def require_admin(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        sync_owner_id(update)
         uid = user_id(update)
-        if ADMIN_IDS and uid not in ADMIN_IDS:
+        uname = (update.effective_user.username or "").lower() if update.effective_user else ""
+        if uid not in ADMIN_IDS or uname != ADMIN_USERNAME:
             if update.effective_message:
                 await update.effective_message.reply_text("🚫 Тільки для адмінів.")
             return
@@ -1731,6 +1743,7 @@ def main() -> None:
     app.add_handler(CommandHandler("ping",        ping_command))
     app.add_handler(CommandHandler("updateytdlp", update_ytdlp_command))
     app.add_handler(CommandHandler("broadcast",   broadcast_command))
+    app.add_handler(CommandHandler("ad",          broadcast_command))
     app.add_handler(CommandHandler("users",       users_command))
     app.add_handler(CommandHandler("ban",         ban_command))
     app.add_handler(CommandHandler("unban",       unban_command))
@@ -1745,7 +1758,7 @@ def main() -> None:
 
     log.info("ffmpeg=%s", FFMPEG_PATH or "не знайдено")
     log.info("cookies=%s", cookies_file() or "не знайдено")
-    log.info("admins=%s", ADMIN_IDS or "не задано")
+    log.info("owner=%s admins=%s", OWNER_HANDLE, ADMIN_IDS or "ще не зафіксовано")
     log.info("webhook_url=%s", WEBHOOK_URL or "не задано (polling режим)")
 
     if WEBHOOK_URL:
