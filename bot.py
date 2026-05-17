@@ -44,7 +44,8 @@ def _ensure_deps() -> None:
     deps = [
         ("requests",   "requests>=2.31.0"),
         ("yt_dlp",     "yt-dlp"),
-        ("telegram.ext", "python-telegram-bot==20.7"),
+        ("telegram.ext", "python-telegram-bot[job-queue]==20.7"),
+        ("apscheduler", "python-telegram-bot[job-queue]==20.7"),
     ]
     for mod, pkg in deps:
         if not _module_ok(mod):
@@ -60,17 +61,19 @@ _ensure_deps()
 import asyncio
 import collections
 import glob
+import ipaddress
 import json
 import logging
 import re
 import shutil
+import socket
 import time
 import traceback
 from datetime import datetime, timedelta
 from functools import partial
 from threading import Event
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 import yt_dlp
@@ -125,6 +128,8 @@ RATE_LIMIT_WINDOW   = int(os.environ.get("RATE_LIMIT_WINDOW",    "60"))
 MAX_RETRIES         = 3
 URL_CACHE_TTL       = int(os.environ.get("URL_CACHE_TTL",        "3600"))   # 1 год
 MAX_HISTORY_PER_USER = 10
+BOT_VERSION = "2.1.0-improved"
+MAX_BROADCAST_DELAY = float(os.environ.get("MAX_BROADCAST_DELAY", "0.05"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -162,55 +167,53 @@ URL_PATTERNS: dict[str, re.Pattern[str]] = {
     "youtube_music": re.compile(r"music\.youtube\.com/watch", re.I),
 }
 
-HELP_TEXT = """🎥 *Fast Video Downloader Bot*
+HELP_TEXT = """🎥 *Video Downloader Bot*
 
-Просто кинь посилання — бот завантажить відео.
+Надішли посилання на відео — бот спробує завантажити його автоматично.
 
-*📥 Завантаження:*
-/dl `<url>` — завантажити відео (аліас /video)
+*Основне:*
 /video `<url>` — завантажити відео
-/audio `<url>` — завантажити аудіо (MP3)
-/thumb `<url>` — обкладинка відео
-/sub `<url>` — субтитри
-/clip `<url> <старт> <кінець>` — вирізати кліп
-    _Приклад:_ `/clip https://... 00:01:30 00:02:00`
+/audio `<url>` — завантажити аудіо MP3
+/quality — вибрати якість: `best`, `fast`, `mobile`
+/checkurl `<url>` — перевірити посилання перед завантаженням
+/myid — показати твій Telegram ID і Chat ID
 
-*ℹ️ Інформація:*
-/info `<url>` — деталі про відео
-/formats `<url>` — список доступних форматів
+*Додатково:*
+/thumb `<url>` — завантажити обкладинку
+/sub `<url>` — знайти субтитри
+/clip `<url> <старт> <кінець>` — вирізати кліп
+/info `<url>` — інформація про відео
+/formats `<url>` — доступні формати
 /platforms — підтримувані платформи
 
-*⚙️ Налаштування:*
-/settings — панель налаштувань
-/quality — переглянути/змінити якість
-  • `best` — максимальна якість
-  • `fast` — до 720p (швидше)
-  • `mobile` — до 480p (малий файл)
-
-*📋 Керування:*
-/cancel — скасувати поточне завантаження
+*Керування:*
+/cancel — скасувати активне завантаження
 /queue — активні завантаження
-/history — останні 10 завантажень
-/clean — видалити старі файли
+/history — останні завантаження
+/clearhistory — очистити свою історію
+/settings — панель налаштувань
+/clean — очистити старі файли
 
-*📊 Статус:*
+*Статус:*
 /stats — статистика
-/health — стан бота
+/health — перевірка сервера
 /ping — перевірка відповіді
 /cookies — перевірити cookies.txt
-/updateytdlp — оновити yt-dlp
+/about — версія та можливості бота
 
-*🔐 Адмін:*
-/broadcast `<текст>` — надіслати всім
-/ad `<текст>` — реклама для всіх
-/users — список юзерів
+*Адмін:*
+/broadcast `<текст>` — повідомлення всім
+/ad `<текст>` — реклама всім
+/users — список користувачів
 /ban `<id>` — заблокувати
 /unban `<id>` — розблокувати
 /resetstats — очистити статистику
-/adminstats — аналітика користувачів
-/userlimit <n|off> — ліміт юзерів
+/adminstats — аналітика
+/userlimit `<n|off>` — ліміт користувачів
+/clearcache — очистити кеш URL
+/savecookies — зберегти cookies.txt через Telegram
 
-_💡 Підказка: YouTube часто потребує cookies.txt на free-серверах._
+_Порада: для YouTube на Render/free-серверах часто потрібен актуальний cookies.txt._
 """
 
 # ─────────────────────────── State ────────────────────────────
@@ -249,6 +252,11 @@ USERS    = read_json(USERS_FILE,    {})
 BANNED_USERS: set[int] = set(read_json(BANS_FILE, []))
 HISTORY: dict[str, list[dict]] = read_json(HISTORY_FILE, {})  # {uid_str: [{url, title, ts, platform}]}
 OWNER_ID: int | None = read_json(OWNER_ID_FILE, None)
+if OWNER_ID:
+    try:
+        ADMIN_IDS.add(int(OWNER_ID))
+    except Exception:
+        OWNER_ID = None
 
 
 def save_stats()    -> None: write_json(STATS_FILE,    STATS)
@@ -260,19 +268,41 @@ def save_owner_id() -> None: write_json(OWNER_ID_FILE, OWNER_ID)
 
 
 def record_user(update: Update) -> None:
+    """Записує користувача й автоматично фіксує owner ID за username."""
+    global OWNER_ID
     user = update.effective_user
     if not user:
         return
-    uid = str(user.id)
+
+    uid_int = int(user.id)
+    uid = str(uid_int)
     changed = uid not in USERS
     USERS.setdefault(uid, {
         "username":   user.username or "",
         "first_name": user.first_name or "",
         "joined":     datetime.utcnow().isoformat(),
+        "last_seen":  datetime.utcnow().isoformat(),
+        "downloads":  0,
     })
+
+    now_iso = datetime.utcnow().isoformat()
+    if USERS[uid].get("last_seen") != now_iso:
+        USERS[uid]["last_seen"] = now_iso
+        changed = True
     if user.username and USERS[uid].get("username") != user.username:
         USERS[uid]["username"] = user.username
         changed = True
+    if user.first_name and USERS[uid].get("first_name") != user.first_name:
+        USERS[uid]["first_name"] = user.first_name
+        changed = True
+
+    if (user.username or "").lower() == ADMIN_USERNAME:
+        if OWNER_ID is None:
+            OWNER_ID = uid_int
+            save_owner_id()
+        if uid_int == OWNER_ID:
+            ADMIN_IDS.add(uid_int)
+
     if changed:
         save_users()
 
@@ -932,12 +962,24 @@ def clip_video_ffmpeg(input_path: str, start: str, end: str, output_path: str) -
 
 # ─────────────────────────── Telegram helpers ─────────────────
 async def safe_edit(message, text: str) -> None:
+    """Безпечне редагування повідомлення з fallback без Markdown."""
+    body = (text or "")[:3900]
     try:
-        await message.edit_text(text[:3900], parse_mode="Markdown")
+        await message.edit_text(body, parse_mode="Markdown")
     except RetryAfter as e:
         await asyncio.sleep(float(e.retry_after) + 0.2)
+        try:
+            await message.edit_text(body, parse_mode="Markdown")
+        except Exception:
+            log.debug("edit retry failed", exc_info=True)
     except BadRequest as e:
-        if "message is not modified" not in str(e).lower():
+        low = str(e).lower()
+        if "message is not modified" in low:
+            return
+        # Часто падає через символи Markdown у назвах відео — тоді шлемо plain text.
+        try:
+            await message.edit_text(body)
+        except Exception:
             log.debug("edit error: %s", e)
     except TelegramError as e:
         log.debug("telegram error: %s", e)
@@ -1039,6 +1081,65 @@ def user_allowed(uid: int) -> bool:
     if not limit:
         return True
     return str(uid) in USERS or len(USERS) < limit
+def _is_public_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(value)
+        return bool(ip.is_global)
+    except ValueError:
+        return False
+
+
+def url_is_safe(url: str) -> bool:
+    """
+    Захист від небезпечних посилань: localhost, приватні IP, link-local, file:// тощо.
+    Це важливо, бо бот може завантажувати прямі файли через requests.
+    """
+    try:
+        parsed = urlparse((url or "").strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False
+
+        host = (parsed.hostname or "").strip().strip("[]").lower()
+        if not host:
+            return False
+
+        if host in {"localhost", "0.0.0.0"} or host.endswith(".localhost") or host.endswith(".local"):
+            return False
+
+        # Якщо у посиланні вже IP — перевіряємо без DNS.
+        try:
+            return ipaddress.ip_address(host).is_global
+        except ValueError:
+            pass
+
+        # Швидка текстова перевірка перед DNS.
+        suspicious = ("127.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.",
+                      "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.",
+                      "172.27.", "172.28.", "172.29.", "172.30.", "172.31.", "192.168.",
+                      "169.254.")
+        if host.startswith(suspicious):
+            return False
+
+        # DNS-перевірка блокує домени, які резолвляться в приватні адреси.
+        try:
+            infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        except socket.gaierror:
+            return True
+
+        checked = 0
+        for info in infos:
+            addr = info[4][0]
+            try:
+                if not ipaddress.ip_address(addr).is_global:
+                    return False
+                checked += 1
+                if checked >= 5:
+                    break
+            except ValueError:
+                continue
+        return True
+    except Exception:
+        return False
 
 
 # ─────────────────────────── Core flow ────────────────────────
@@ -1127,6 +1228,10 @@ async def download_and_send(
             if size:
                 stats_ok(platform, size)
                 record_history(uid, url, title, platform)
+                if str(uid) in USERS:
+                    USERS[str(uid)]["downloads"] = int(USERS[str(uid)].get("downloads", 0)) + 1
+                    USERS[str(uid)]["last_download"] = datetime.utcnow().isoformat()
+                    save_users()
                 if file_id:
                     cache_set(url, audio, file_id, title)
             try:
@@ -1153,6 +1258,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if len(urls) > 1:
         await msg.reply_text(f"🔗 Знайдено {len(urls)} посилання. Оброблю по черзі.")
     for url in urls:
+        if not url_is_safe(url):
+            await msg.reply_text("❌ Небезпечне або невалідне посилання.")
+            continue
         platform = "direct" if DIRECT_VIDEO_RE.search(url) else detect_platform(url)
         if not platform:
             await msg.reply_text(f"❌ Платформа не підтримується:\n`{url[:100]}`", parse_mode="Markdown")
@@ -1183,6 +1291,9 @@ async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not url:
         await msg.reply_text("❌ Використання: /video <посилання>")
         return
+    if not url_is_safe(url):
+        await msg.reply_text("❌ Небезпечне або невалідне посилання.")
+        return
     platform = "direct" if DIRECT_VIDEO_RE.search(url) else detect_platform(url)
     if not platform:
         await msg.reply_text("❌ Платформа не підтримується.")
@@ -1201,6 +1312,9 @@ async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         url   = found[0] if found else None
     if not url:
         await msg.reply_text("❌ Використання: /audio <посилання>")
+        return
+    if not url_is_safe(url):
+        await msg.reply_text("❌ Небезпечне або невалідне посилання.")
         return
     platform = detect_platform(url)
     if not platform:
@@ -1590,6 +1704,142 @@ async def update_ytdlp_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await safe_edit(status, f"❌ Не вдалося оновити yt-dlp:\n{safe_text(e, 600)}")
 
 
+
+# ─────────────────────────── Extra user/admin commands ─────────
+def get_first_url_from_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    msg = update.effective_message
+    if context.args:
+        found = extract_urls(" ".join(context.args))
+        if found:
+            return found[0]
+    if msg and msg.reply_to_message and msg.reply_to_message.text:
+        found = extract_urls(msg.reply_to_message.text)
+        if found:
+            return found[0]
+    return None
+
+
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    record_user(update)
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    username = f"@{user.username}" if user.username else "—"
+    await msg.reply_text(
+        f"🆔 User ID: `{user.id}`\n"
+        f"💬 Chat ID: `{chat_id(update)}`\n"
+        f"👤 Username: {username}",
+        parse_mode="Markdown",
+    )
+
+
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    record_user(update)
+    if not update.effective_message:
+        return
+    await update.effective_message.reply_text(
+        f"🤖 *Video Downloader Bot*\n"
+        f"Версія: `{BOT_VERSION}`\n"
+        f"Режим: `{'webhook' if WEBHOOK_URL else 'polling'}`\n"
+        f"Платформ: `{len(URL_PATTERNS)}`\n"
+        f"FFmpeg: {'✅' if FFMPEG_PATH else '❌'}\n"
+        f"Cookies: {'✅' if cookies_file() else '❌'}\n"
+        f"Аптайм: {uptime_text()}",
+        parse_mode="Markdown",
+    )
+
+
+async def check_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    record_user(update)
+    msg = update.effective_message
+    if not msg:
+        return
+
+    url = get_first_url_from_context(update, context)
+    if not url:
+        await msg.reply_text("❌ Використання: /checkurl <посилання>")
+        return
+
+    safe = url_is_safe(url)
+    platform = "direct" if DIRECT_VIDEO_RE.search(url) else detect_platform(url)
+    cached_video = cache_get(url, False)
+    cached_audio = cache_get(url, True)
+
+    lines = [
+        "🔎 *Перевірка посилання*",
+        f"Безпека: {'✅ OK' if safe else '❌ небезпечне/невалідне'}",
+        f"Платформа: `{platform or 'не підтримується'}`",
+        f"Якість чату: `{quality_for(chat_id(update))}`",
+        f"Кеш відео: {'✅ є' if cached_video else '—'}",
+        f"Кеш аудіо: {'✅ є' if cached_audio else '—'}",
+    ]
+    if not platform:
+        lines.append("")
+        lines.append("Цю платформу бот зараз не розпізнає. Можна спробувати пряме mp4/mov/webm/m4v посилання.")
+    await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def clear_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    record_user(update)
+    msg = update.effective_message
+    if not msg:
+        return
+    uid = str(user_id(update))
+    existed = len(HISTORY.get(uid, []))
+    HISTORY.pop(uid, None)
+    save_history()
+    await msg.reply_text(f"🧹 Історію очищено. Видалено записів: {existed}")
+
+
+@require_admin
+async def clear_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    count = len(URL_CACHE)
+    URL_CACHE.clear()
+    await msg.reply_text(f"🧹 URL-кеш очищено. Видалено записів: {count}")
+
+
+@require_admin
+async def save_cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Зберігає cookies.txt, якщо команду написати у відповідь на документ."""
+    msg = update.effective_message
+    if not msg:
+        return
+    reply = msg.reply_to_message
+    if not reply or not reply.document:
+        await msg.reply_text("❌ Надішли cookies.txt у Telegram, потім відповідай на файл командою /savecookies.")
+        return
+
+    filename = (reply.document.file_name or "").lower()
+    if not filename.endswith(".txt"):
+        await msg.reply_text("❌ Файл має бути .txt у форматі Netscape cookies.")
+        return
+
+    target = BASE_DIR / "cookies.txt"
+    tmp = BASE_DIR / "cookies.upload.tmp"
+    try:
+        tg_file = await context.bot.get_file(reply.document.file_id)
+        await tg_file.download_to_drive(custom_path=str(tmp))
+        first = tmp.read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
+        if first not in {"# Netscape HTTP Cookie File", "# HTTP Cookie File"}:
+            tmp.unlink(missing_ok=True)
+            await msg.reply_text(
+                "❌ Неправильний формат cookies.txt.\n"
+                "Перший рядок має бути: `# Netscape HTTP Cookie File`",
+                parse_mode="Markdown",
+            )
+            return
+        tmp.replace(target)
+        await msg.reply_text(f"✅ cookies.txt збережено.\nРозмір: {human_bytes(target.stat().st_size)}")
+    except Exception as e:
+        remove_file(tmp)
+        await msg.reply_text(f"❌ Не вдалося зберегти cookies.txt:\n{safe_text(e, 700)}")
+
+
+
 # ─────────────────────────── Callbacks ────────────────────────
 async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1661,6 +1911,14 @@ def require_admin(func):
     return wrapper
 
 
+def admin_only_command(func):
+    @require_admin
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await func(update, context)
+    wrapped.__name__ = func.__name__
+    return wrapped
+
+
 @require_admin
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -1669,6 +1927,9 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     text = " ".join(context.args) if context.args else ""
     if not text:
         await msg.reply_text("❌ Використання: /broadcast <текст>")
+        return
+    if len(text) > 3500:
+        await msg.reply_text("❌ Занадто довге повідомлення (макс 3500 символів).")
         return
     status = await msg.reply_text(f"📡 Надсилаю {len(USERS)} юзерам...")
     ok, fail = 0, 0
@@ -1776,6 +2037,21 @@ async def user_limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     SETTINGS.setdefault("limits", {})["max_users"] = value
     save_settings()
     await msg.reply_text(f"✅ Ліміт юзерів: {'off' if value == 0 else value}")
+@require_admin
+async def admin_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    await msg.reply_text(
+        "🔐 *Admin commands:*\n"
+        "/broadcast, /ad, /users, /ban, /unban\n"
+        "/resetstats, /adminstats, /userlimit\n"
+        "/stats, /history, /queue, /cancel, /clean\n"
+        "/health, /ping, /cookies, /updateytdlp\n"
+        "/thumb, /sub, /clip, /info, /formats, /platforms, /settings\n"
+        "/clearcache, /savecookies, /myid, /checkurl, /about",
+        parse_mode="Markdown",
+    )
 
 
 # ─────────────────────────── Error handler ────────────────────
@@ -1797,33 +2073,43 @@ def main() -> None:
 
     app = Application.builder().token(TOKEN).build()
 
-    # Scheduled cleanup кожні 2 години
-    app.job_queue.run_repeating(scheduled_cleanup, interval=7200, first=60)
+    # Scheduled cleanup кожні 2 години. Якщо встановлено PTB без job-queue, бот все одно запуститься.
+    if app.job_queue:
+        app.job_queue.run_repeating(scheduled_cleanup, interval=7200, first=60)
+    else:
+        log.warning("JobQueue недоступний. Додай python-telegram-bot[job-queue]==20.7 у requirements.txt")
 
     # Команди
     app.add_handler(CommandHandler("start",       start_command))
     app.add_handler(CommandHandler("help",        start_command))
+    app.add_handler(CommandHandler("admin",       admin_help_command))
+    app.add_handler(CommandHandler("myid",        myid_command))
+    app.add_handler(CommandHandler("about",       about_command))
+    app.add_handler(CommandHandler("checkurl",    check_url_command))
+    app.add_handler(CommandHandler("clearhistory", clear_history_command))
     app.add_handler(CommandHandler("dl",          dl_command))
     app.add_handler(CommandHandler("video",       video_command))
     app.add_handler(CommandHandler("audio",       audio_command))
-    app.add_handler(CommandHandler("thumb",       thumb_command))
-    app.add_handler(CommandHandler("sub",         sub_command))
-    app.add_handler(CommandHandler("clip",        clip_command))
-    app.add_handler(CommandHandler("info",        info_command))
-    app.add_handler(CommandHandler("formats",     formats_command))
-    app.add_handler(CommandHandler("platforms",   platforms_command))
+    app.add_handler(CommandHandler("thumb",       admin_only_command(thumb_command)))
+    app.add_handler(CommandHandler("sub",         admin_only_command(sub_command)))
+    app.add_handler(CommandHandler("clip",        admin_only_command(clip_command)))
+    app.add_handler(CommandHandler("info",        admin_only_command(info_command)))
+    app.add_handler(CommandHandler("formats",     admin_only_command(formats_command)))
+    app.add_handler(CommandHandler("platforms",   admin_only_command(platforms_command)))
     app.add_handler(CommandHandler("quality",     quality_command))
     app.add_handler(CommandHandler("settings",    settings_command))
     app.add_handler(CommandHandler("history",     history_command))
     app.add_handler(CommandHandler("stats",       stats_command))
-    app.add_handler(CommandHandler("resetstats",  reset_stats_command))
-    app.add_handler(CommandHandler("health",      health_command))
-    app.add_handler(CommandHandler("cookies",     cookies_command))
-    app.add_handler(CommandHandler("clean",       clean_command))
-    app.add_handler(CommandHandler("cancel",      cancel_command))
-    app.add_handler(CommandHandler("queue",       queue_command))
-    app.add_handler(CommandHandler("ping",        ping_command))
-    app.add_handler(CommandHandler("updateytdlp", update_ytdlp_command))
+    app.add_handler(CommandHandler("resetstats",  admin_only_command(reset_stats_command)))
+    app.add_handler(CommandHandler("health",      admin_only_command(health_command)))
+    app.add_handler(CommandHandler("cookies",     admin_only_command(cookies_command)))
+    app.add_handler(CommandHandler("clean",       admin_only_command(clean_command)))
+    app.add_handler(CommandHandler("cancel",      admin_only_command(cancel_command)))
+    app.add_handler(CommandHandler("queue",       admin_only_command(queue_command)))
+    app.add_handler(CommandHandler("ping",        admin_only_command(ping_command)))
+    app.add_handler(CommandHandler("updateytdlp", admin_only_command(update_ytdlp_command)))
+    app.add_handler(CommandHandler("clearcache",  clear_cache_command))
+    app.add_handler(CommandHandler("savecookies", save_cookies_command))
     app.add_handler(CommandHandler("broadcast",   broadcast_command))
     app.add_handler(CommandHandler("ad",          broadcast_command))
     app.add_handler(CommandHandler("users",       users_command))
@@ -1861,11 +2147,14 @@ def main() -> None:
         # ── Polling режим (локальна розробка) ────────────────────
         log.info("Запускаю в polling режимі")
         # Прибираємо старий webhook якщо є
-        requests.get(
-            f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
-            params={"drop_pending_updates": "true"},
-            timeout=10,
-        )
+        try:
+            requests.get(
+                f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
+                params={"drop_pending_updates": "true"},
+                timeout=10,
+            )
+        except Exception:
+            log.warning("Не вдалося очистити webhook перед polling", exc_info=True)
         app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
