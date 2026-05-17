@@ -98,8 +98,9 @@ if not TOKEN:
 # Якщо не задано — бот запускається в polling режимі (для локальної розробки)
 WEBHOOK_URL: str | None = os.environ.get("WEBHOOK_URL", "").rstrip("/") or None
 
-_admin_env = os.environ.get("ADMIN_IDS", "")
-ADMIN_IDS: set[int] = {int(x.strip()) for x in _admin_env.split(",") if x.strip().isdigit()}
+ADMIN_USERNAME = "dimagymenjuk"
+OWNER_HANDLE = f"@{ADMIN_USERNAME}"
+ADMIN_IDS: set[int] = set()  # Динамічно фіксуємо ID власника за username
 
 BASE_DIR     = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
@@ -110,6 +111,7 @@ SETTINGS_FILE = BASE_DIR / "bot_settings.json"
 USERS_FILE    = BASE_DIR / "bot_users.json"
 BANS_FILE     = BASE_DIR / "bot_bans.json"
 HISTORY_FILE  = BASE_DIR / "bot_history.json"
+OWNER_ID_FILE = BASE_DIR / "bot_owner_id.json"
 
 MAX_UPLOAD_BYTES    = int(os.environ.get("MAX_UPLOAD_BYTES",     str(49 * 1024 * 1024)))
 PROGRESS_THROTTLE   = float(os.environ.get("PROGRESS_THROTTLE",  "1.5"))
@@ -160,52 +162,18 @@ URL_PATTERNS: dict[str, re.Pattern[str]] = {
     "youtube_music": re.compile(r"music\.youtube\.com/watch", re.I),
 }
 
-HELP_TEXT = """🎥 *Fast Video Downloader Bot*
+HELP_TEXT = """🎥 *Video Downloader Bot*
 
-Просто кинь посилання — бот завантажить відео.
+Після старту доступні тільки базові команди:
 
-*📥 Завантаження:*
-/dl `<url>` — завантажити відео (аліас /video)
 /video `<url>` — завантажити відео
 /audio `<url>` — завантажити аудіо (MP3)
-/thumb `<url>` — обкладинка відео
-/sub `<url>` — субтитри
-/clip `<url> <старт> <кінець>` — вирізати кліп
-    _Приклад:_ `/clip https://... 00:01:30 00:02:00`
+/quality — змінити якість:
+  • `best` — максимальна
+  • `fast` — до 720p
+  • `mobile` — до 480p
 
-*ℹ️ Інформація:*
-/info `<url>` — деталі про відео
-/formats `<url>` — список доступних форматів
-/platforms — підтримувані платформи
-
-*⚙️ Налаштування:*
-/settings — панель налаштувань
-/quality — переглянути/змінити якість
-  • `best` — максимальна якість
-  • `fast` — до 720p (швидше)
-  • `mobile` — до 480p (малий файл)
-
-*📋 Керування:*
-/cancel — скасувати поточне завантаження
-/queue — активні завантаження
-/history — останні 10 завантажень
-/clean — видалити старі файли
-
-*📊 Статус:*
-/stats — статистика
-/health — стан бота
-/ping — перевірка відповіді
-/cookies — перевірити cookies.txt
-/updateytdlp — оновити yt-dlp
-
-*🔐 Адмін:*
-/broadcast `<текст>` — надіслати всім
-/users — список юзерів
-/ban `<id>` — заблокувати
-/unban `<id>` — розблокувати
-/resetstats — очистити статистику
-
-_💡 Підказка: YouTube часто потребує cookies.txt на free-серверах._
+Просто надішли посилання — і бот завантажить файл.
 """
 
 # ─────────────────────────── State ────────────────────────────
@@ -243,6 +211,7 @@ SETTINGS = read_json(SETTINGS_FILE, {"quality": {}})
 USERS    = read_json(USERS_FILE,    {})
 BANNED_USERS: set[int] = set(read_json(BANS_FILE, []))
 HISTORY: dict[str, list[dict]] = read_json(HISTORY_FILE, {})  # {uid_str: [{url, title, ts, platform}]}
+OWNER_ID: int | None = read_json(OWNER_ID_FILE, None)
 
 
 def save_stats()    -> None: write_json(STATS_FILE,    STATS)
@@ -250,6 +219,7 @@ def save_settings() -> None: write_json(SETTINGS_FILE, SETTINGS)
 def save_users()    -> None: write_json(USERS_FILE,    USERS)
 def save_bans()     -> None: write_json(BANS_FILE,     list(BANNED_USERS))
 def save_history()  -> None: write_json(HISTORY_FILE,  HISTORY)
+def save_owner_id() -> None: write_json(OWNER_ID_FILE, OWNER_ID)
 
 
 def record_user(update: Update) -> None:
@@ -1017,6 +987,31 @@ def settings_keyboard(cid: int) -> InlineKeyboardMarkup:
     ])
 
 
+def user_limit() -> int:
+    raw = SETTINGS.get("limits", {}).get("max_users", 0)
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 0
+
+
+def user_allowed(uid: int) -> bool:
+    if uid in ADMIN_IDS:
+        return True
+    limit = user_limit()
+    if not limit:
+        return True
+    return str(uid) in USERS or len(USERS) < limit
+
+
+def url_is_safe(url: str) -> bool:
+    low = (url or "").lower()
+    if not low.startswith(("http://", "https://")):
+        return False
+    bad = ("127.0.0.1", "localhost", "0.0.0.0", "169.254.", "::1")
+    return not any(x in low for x in bad)
+
+
 # ─────────────────────────── Core flow ────────────────────────
 async def download_and_send(
     update: Update,
@@ -1034,6 +1029,9 @@ async def download_and_send(
 
     if uid in BANNED_USERS:
         await msg.reply_text("🚫 Ти заблокований у цьому боті.")
+        return
+    if not user_allowed(uid):
+        await msg.reply_text("⛔ Бот тимчасово закритий для нових користувачів.")
         return
 
     if not check_rate_limit(uid):
@@ -1126,6 +1124,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if len(urls) > 1:
         await msg.reply_text(f"🔗 Знайдено {len(urls)} посилання. Оброблю по черзі.")
     for url in urls:
+        if not url_is_safe(url):
+            await msg.reply_text("❌ Небезпечне або невалідне посилання.")
+            continue
         platform = "direct" if DIRECT_VIDEO_RE.search(url) else detect_platform(url)
         if not platform:
             await msg.reply_text(f"❌ Платформа не підтримується:\n`{url[:100]}`", parse_mode="Markdown")
@@ -1156,6 +1157,9 @@ async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not url:
         await msg.reply_text("❌ Використання: /video <посилання>")
         return
+    if not url_is_safe(url):
+        await msg.reply_text("❌ Небезпечне або невалідне посилання.")
+        return
     platform = "direct" if DIRECT_VIDEO_RE.search(url) else detect_platform(url)
     if not platform:
         await msg.reply_text("❌ Платформа не підтримується.")
@@ -1174,6 +1178,9 @@ async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         url   = found[0] if found else None
     if not url:
         await msg.reply_text("❌ Використання: /audio <посилання>")
+        return
+    if not url_is_safe(url):
+        await msg.reply_text("❌ Небезпечне або невалідне посилання.")
         return
     platform = detect_platform(url)
     if not platform:
@@ -1604,16 +1611,42 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ─────────────────────────── Admin ────────────────────────────
+def sync_owner_id(update: Update) -> None:
+    global OWNER_ID
+    user = update.effective_user
+    if not user or not user.username:
+        return
+    uname = user.username.lower()
+    uid = int(user.id)
+    if uname != ADMIN_USERNAME:
+        return
+    if OWNER_ID is None:
+        OWNER_ID = uid
+        save_owner_id()
+    if uid == OWNER_ID:
+        ADMIN_IDS.add(uid)
+
+
 def require_admin(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        sync_owner_id(update)
         uid = user_id(update)
-        if ADMIN_IDS and uid not in ADMIN_IDS:
+        uname = (update.effective_user.username or "").lower() if update.effective_user else ""
+        if uid not in ADMIN_IDS or uname != ADMIN_USERNAME or (OWNER_ID is not None and uid != OWNER_ID):
             if update.effective_message:
                 await update.effective_message.reply_text("🚫 Тільки для адмінів.")
             return
         await func(update, context)
     wrapper.__name__ = func.__name__
     return wrapper
+
+
+def admin_only_command(func):
+    @require_admin
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await func(update, context)
+    wrapped.__name__ = func.__name__
+    return wrapped
 
 
 @require_admin
@@ -1624,6 +1657,9 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     text = " ".join(context.args) if context.args else ""
     if not text:
         await msg.reply_text("❌ Використання: /broadcast <текст>")
+        return
+    if len(text) > 3500:
+        await msg.reply_text("❌ Занадто довге повідомлення (макс 3500 символів).")
         return
     status = await msg.reply_text(f"📡 Надсилаю {len(USERS)} юзерам...")
     ok, fail = 0, 0
@@ -1684,6 +1720,71 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await msg.reply_text(f"✅ Юзер {uid} розблокований.")
 
 
+
+
+@require_admin
+async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    now = datetime.utcnow()
+    recent = 0
+    for u in USERS.values():
+        try:
+            if now - datetime.fromisoformat(u.get("joined", "")) <= timedelta(hours=24):
+                recent += 1
+        except Exception:
+            pass
+    limit = user_limit()
+    txt = (
+        f"👑 Власник: {OWNER_HANDLE}\n"
+        f"🆔 Owner ID: `{OWNER_ID or 'ще не зафіксовано'}`\n"
+        f"👥 Користувачів: {len(USERS)}\n"
+        f"🕒 Нових за 24г: {recent}\n"
+        f"🚫 Заблокованих: {len(BANNED_USERS)}\n"
+        f"🎚 Ліміт юзерів: {'off' if limit == 0 else limit}"
+    )
+    await msg.reply_text(txt, parse_mode="Markdown")
+
+
+@require_admin
+async def user_limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    if not context.args:
+        current = user_limit()
+        await msg.reply_text(f"Поточний ліміт: {'off' if current == 0 else current}")
+        return
+    arg = context.args[0].lower()
+    if arg == 'off':
+        value = 0
+    elif arg.isdigit():
+        value = max(0, int(arg))
+    else:
+        await msg.reply_text("❌ Використання: /userlimit <n|off>")
+        return
+    SETTINGS.setdefault("limits", {})["max_users"] = value
+    save_settings()
+    await msg.reply_text(f"✅ Ліміт юзерів: {'off' if value == 0 else value}")
+
+
+@require_admin
+async def admin_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    await msg.reply_text(
+        "🔐 *Admin commands:*\n"
+        "/broadcast, /ad, /users, /ban, /unban\n"
+        "/resetstats, /adminstats, /userlimit\n"
+        "/stats, /history, /queue, /cancel, /clean\n"
+        "/health, /ping, /cookies, /updateytdlp\n"
+        "/thumb, /sub, /clip, /info, /formats, /platforms, /settings",
+        parse_mode="Markdown",
+    )
+
+
 # ─────────────────────────── Error handler ────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Unhandled error:", exc_info=context.error)
@@ -1709,31 +1810,35 @@ def main() -> None:
     # Команди
     app.add_handler(CommandHandler("start",       start_command))
     app.add_handler(CommandHandler("help",        start_command))
+    app.add_handler(CommandHandler("admin",       admin_help_command))
     app.add_handler(CommandHandler("dl",          dl_command))
     app.add_handler(CommandHandler("video",       video_command))
     app.add_handler(CommandHandler("audio",       audio_command))
-    app.add_handler(CommandHandler("thumb",       thumb_command))
-    app.add_handler(CommandHandler("sub",         sub_command))
-    app.add_handler(CommandHandler("clip",        clip_command))
-    app.add_handler(CommandHandler("info",        info_command))
-    app.add_handler(CommandHandler("formats",     formats_command))
-    app.add_handler(CommandHandler("platforms",   platforms_command))
+    app.add_handler(CommandHandler("thumb",       admin_only_command(thumb_command)))
+    app.add_handler(CommandHandler("sub",         admin_only_command(sub_command)))
+    app.add_handler(CommandHandler("clip",        admin_only_command(clip_command)))
+    app.add_handler(CommandHandler("info",        admin_only_command(info_command)))
+    app.add_handler(CommandHandler("formats",     admin_only_command(formats_command)))
+    app.add_handler(CommandHandler("platforms",   admin_only_command(platforms_command)))
     app.add_handler(CommandHandler("quality",     quality_command))
-    app.add_handler(CommandHandler("settings",    settings_command))
-    app.add_handler(CommandHandler("history",     history_command))
-    app.add_handler(CommandHandler("stats",       stats_command))
-    app.add_handler(CommandHandler("resetstats",  reset_stats_command))
-    app.add_handler(CommandHandler("health",      health_command))
-    app.add_handler(CommandHandler("cookies",     cookies_command))
-    app.add_handler(CommandHandler("clean",       clean_command))
-    app.add_handler(CommandHandler("cancel",      cancel_command))
-    app.add_handler(CommandHandler("queue",       queue_command))
-    app.add_handler(CommandHandler("ping",        ping_command))
-    app.add_handler(CommandHandler("updateytdlp", update_ytdlp_command))
+    app.add_handler(CommandHandler("settings",    admin_only_command(settings_command)))
+    app.add_handler(CommandHandler("history",     admin_only_command(history_command)))
+    app.add_handler(CommandHandler("stats",       admin_only_command(stats_command)))
+    app.add_handler(CommandHandler("resetstats",  admin_only_command(reset_stats_command)))
+    app.add_handler(CommandHandler("health",      admin_only_command(health_command)))
+    app.add_handler(CommandHandler("cookies",     admin_only_command(cookies_command)))
+    app.add_handler(CommandHandler("clean",       admin_only_command(clean_command)))
+    app.add_handler(CommandHandler("cancel",      admin_only_command(cancel_command)))
+    app.add_handler(CommandHandler("queue",       admin_only_command(queue_command)))
+    app.add_handler(CommandHandler("ping",        admin_only_command(ping_command)))
+    app.add_handler(CommandHandler("updateytdlp", admin_only_command(update_ytdlp_command)))
     app.add_handler(CommandHandler("broadcast",   broadcast_command))
+    app.add_handler(CommandHandler("ad",          broadcast_command))
     app.add_handler(CommandHandler("users",       users_command))
     app.add_handler(CommandHandler("ban",         ban_command))
     app.add_handler(CommandHandler("unban",       unban_command))
+    app.add_handler(CommandHandler("adminstats",  admin_stats_command))
+    app.add_handler(CommandHandler("userlimit",   user_limit_command))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(quality_callback,  pattern=r"^quality:"))
@@ -1745,7 +1850,7 @@ def main() -> None:
 
     log.info("ffmpeg=%s", FFMPEG_PATH or "не знайдено")
     log.info("cookies=%s", cookies_file() or "не знайдено")
-    log.info("admins=%s", ADMIN_IDS or "не задано")
+    log.info("owner=%s admins=%s", OWNER_HANDLE, ADMIN_IDS or "ще не зафіксовано")
     log.info("webhook_url=%s", WEBHOOK_URL or "не задано (polling режим)")
 
     if WEBHOOK_URL:
