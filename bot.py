@@ -1776,4 +1776,4 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        traceback.print_exc()ц
+        traceback.print_exc()
