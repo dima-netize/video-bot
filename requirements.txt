@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
-flask
-requests
-yt-dlp
+python-telegram-bot[job-queue]==20.7
+requests==2.31.0
+python-dotenv==1.0.1
+yt-dlp==2024.4.9
