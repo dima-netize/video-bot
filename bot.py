@@ -40,21 +40,11 @@ def _pip_install(package: str) -> None:
     print(f"[BOOT] Installing: {package}", flush=True)
     env = os.environ.copy()
     env["PIP_NO_CACHE_DIR"] = "1"
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--no-cache-dir",
-        "-U",
-    ]
+    cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir", "-U"]
     if not _IN_VENV:
         cmd.append("--user")
     cmd.append(package)
-
     subprocess.check_call(cmd, env=env)
-
     if not _IN_VENV:
         user_site = Path(site.getusersitepackages())
         if user_site.exists() and str(user_site) not in sys.path:
@@ -72,9 +62,8 @@ def _ensure_deps() -> None:
         ("telegram.ext", "python-telegram-bot[webhooks,job-queue]>=21.0,<22.0"),
     ]
     for module_name, package_name in deps:
-        _pip_install(package_name)
-    if not _module_ok("tornado") or not _module_ok("apscheduler"):
-        _pip_install("python-telegram-bot[webhooks,job-queue]>=21.0,<22.0")
+        if not _module_ok(module_name):
+            _pip_install(package_name)
     bad = [module_name for module_name, _ in deps if not _module_ok(module_name)]
     if bad:
         raise RuntimeError("Не вдалося встановити залежності: " + ", ".join(bad))
@@ -98,7 +87,7 @@ from datetime import datetime
 from functools import partial
 from threading import Event
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 
 import requests
 import yt_dlp
@@ -145,6 +134,7 @@ RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "2"))
 URL_CACHE_TTL = int(os.environ.get("URL_CACHE_TTL", "3600"))
 MAX_HISTORY_PER_USER = int(os.environ.get("MAX_HISTORY_PER_USER", "10"))
+DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "300"))
 
 PARALLEL_LIMIT = asyncio.Semaphore(PARALLEL_DOWNLOADS)
 
@@ -204,6 +194,17 @@ URL_PATTERNS: dict[str, re.Pattern[str]] = {
     "medal": re.compile(r"medal\.tv/", re.I),
 }
 
+COBALT_SUPPORTED = {
+    "youtube", "instagram", "tiktok", "twitter",
+    "facebook", "reddit", "pinterest", "vimeo",
+    "dailymotion", "twitch",
+}
+
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "fbclid", "igshid", "si", "feature", "share_id", "ref", "h",
+}
+
 USER_HELP_TEXT = """🎥 *Video Downloader Bot*
 
 Кинь посилання — бот завантажить відео або аудіо.
@@ -221,7 +222,8 @@ USER_HELP_TEXT = """🎥 *Video Downloader Bot*
 /ping — перевірка бота
 
 *💡 Поради:*
-• Без cookies Instagram і YouTube часто не качають на безкоштовних серверах.
+• Instagram без cookies — працює через проксі (ddinstagram).
+• YouTube без cookies — може блокувати, додай cookies.txt.
 • Якщо відео велике — постав /quality mobile.
 • Для скасування надішли /cancel під час завантаження.
 """
@@ -394,6 +396,31 @@ def platform_for_url(url: str) -> str | None:
     return detect_platform(url)
 
 
+def normalize_url(url: str) -> str:
+    """Очистка URL від трекінг-параметрів та нормалізація."""
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        clean_qs = {k: v for k, v in qs.items() if k not in TRACKING_PARAMS}
+        new_query = urlencode(clean_qs, doseq=True) if clean_qs else ""
+        normalized = parsed._replace(query=new_query).geturl()
+        normalized = normalized.replace("m.youtube.com", "www.youtube.com")
+        normalized = normalized.replace("m.instagram.com", "www.instagram.com")
+        normalized = normalized.replace("m.facebook.com", "www.facebook.com")
+        return normalized
+    except Exception:
+        return url
+
+
+def to_ddinstagram(url: str) -> str:
+    """Конвертує instagram.com URL у ddinstagram.com проксі."""
+    return (
+        url
+        .replace("www.instagram.com", "ddinstagram.com")
+        .replace("instagram.com", "ddinstagram.com")
+    )
+
+
 def safe_filename(prefix: str, url: str, ext: str = "mp4") -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     slug = url.split("?")[0].rstrip("/").split("/")[-1] or "video"
@@ -433,27 +460,6 @@ def quality_keyboard() -> InlineKeyboardMarkup:
             ]
         ]
     )
-
-
-def parse_time_to_seconds(value: str) -> int | None:
-    parts = value.strip().split(":")
-    if len(parts) not in {2, 3}:
-        return None
-    try:
-        nums = [int(x) for x in parts]
-    except ValueError:
-        return None
-    if any(x < 0 for x in nums):
-        return None
-    if len(nums) == 2:
-        minutes, seconds = nums
-        if seconds >= 60:
-            return None
-        return minutes * 60 + seconds
-    hours, minutes, seconds = nums
-    if minutes >= 60 or seconds >= 60:
-        return None
-    return hours * 3600 + minutes * 60 + seconds
 
 
 def rate_limited(uid: int) -> bool:
@@ -565,75 +571,72 @@ def friendly_error(platform: str | None, error: str) -> str:
             "not a bot",
             "use --cookies",
             "confirm you're not a bot",
+            "po token",
         ]
     ):
         return (
             "🍪 YouTube просить авторизацію.\n\n"
-            "Поклади cookies.txt поруч із bot.py.\n"
-            "Перший рядок має бути:\n"
-            "# Netscape HTTP Cookie File\n\n"
-            "Без cookies YouTube часто блокує free-сервери."
+            "Рішення:\n"
+            "1. Поклади cookies.txt поруч із bot.py\n"
+            "2. Перший рядок: # Netscape HTTP Cookie File\n"
+            "3. Експортуй cookies з браузера (розширення Get cookies.txt)\n\n"
+            "Без cookies YouTube блокує free-сервери."
         )
 
     if platform == "instagram" and any(
         x in low
         for x in [
-            "login",
-            "log in",
-            "sign in",
-            "private",
-            "restricted",
-            "unauthorized",
-            "please wait",
-            "rate limit",
-            "429",
+            "login", "log in", "sign in", "private",
+            "restricted", "unauthorized", "please wait",
         ]
     ):
         has_cookies = bool(cookies_file())
         if has_cookies:
             return (
-                "🔒 Instagram заблокував цей запит.\n\n"
+                "🔒 Instagram заблокував запит.\n\n"
                 "Можливі причини:\n"
                 "• cookies.txt застарів або неправильний\n"
-                "• аккаунт, з якого взяті cookies, забанений\n"
-                "• Instagram тимчасово обмежив IP сервера\n\n"
-                "Спробуй оновити cookies.txt і почекати 10-15 хвилин."
+                "• акаунт забанений\n"
+                "• IP тимчасово обмежений\n\n"
+                "Спробуй оновити cookies.txt і почекати 10-15 хв."
             )
         return (
-            "🔒 Instagram вимагає авторизацію.\n\n"
-            "Без cookies.txt на free-сервері майже нічого не скачається.\n\n"
-            "Як виправити:\n"
-            "1. Увійди в Instagram у браузері Chrome/Firefox\n"
+            "🔒 Instagram заблокував запит.\n\n"
+            "Бот вже пробував проксі (ddinstagram.com), але не вийшло.\n\n"
+            "Для надійності додай cookies.txt:\n"
+            "1. Увійди в Instagram у Chrome\n"
             "2. Встанови розширення Get cookies.txt LOCALLY\n"
             "3. Експортуй cookies для instagram.com\n"
-            "4. Поклади cookies.txt поруч із bot.py\n"
-            "5. Перший рядок файлу має бути:\n"
-            "# Netscape HTTP Cookie File"
+            "4. Поклади файл поруч із bot.py\n"
+            "5. Перший рядок: # Netscape HTTP Cookie File"
         )
 
     if "requested format is not available" in low:
         return "⚠️ Ця якість недоступна. Спробуй /quality fast або /quality mobile."
 
     if "ffmpeg" in low and not FFMPEG_PATH:
-        return "⚠️ Немає ffmpeg. Постав /quality fast або /quality mobile."
+        return "⚠️ Немає ffmpeg на сервері. Для аудіо потрібен ffmpeg. Спробуй /quality fast для відео."
 
     if "unsupported url" in low:
         return "❌ Посилання не підтримується або платформа змінила захист."
 
     if "private" in low or "login" in low:
-        return "🔒 Відео приватне або потрібен вхід. Потрібен cookies.txt."
+        return "🔒 Відео приватне або потрібен вхід. Додай cookies.txt."
 
     if any(x in low for x in ["network", "connection", "timeout", "reset by peer", "read error"]):
         return "🌐 Помилка мережі. Спробуй ще раз через хвилину."
 
     if any(x in low for x in ["429", "too many", "rate limit"]):
-        return "⏳ Платформа тимчасово блокує завантаження. Зачекай 5-10 хвилин."
+        return "⏳ Платформа тимчасово блокує. Зачекай 5-10 хвилин."
 
     if "geo" in low or "not available in your country" in low:
         return "🌍 Відео недоступне в регіоні сервера."
 
     if "name resolution" in low or "resolve" in low:
-        return "🌐 DNS-помилка: сервер не може звернутися до стороннього сервісу. Спробуй ще раз."
+        return "🌐 DNS-помилка. Спробуй ще раз."
+
+    if "video unavailable" in low and platform == "youtube":
+        return "❌ Відео недоступне (видалено, приватне або обмежене віком)."
 
     return safe_text(err, 900)
 
@@ -643,16 +646,9 @@ def is_transient_error(error: str) -> bool:
     return any(
         x in low
         for x in [
-            "network",
-            "connection",
-            "timeout",
-            "reset by peer",
-            "read error",
-            "http error 5",
-            "503",
-            "502",
-            "429",
-            "name resolution",
+            "network", "connection", "timeout", "reset by peer",
+            "read error", "http error 5", "503", "502", "429",
+            "name resolution", "eof occurred",
         ]
     )
 
@@ -671,11 +667,11 @@ def find_file(info: dict[str, Any], ydl: yt_dlp.YoutubeDL) -> str | None:
     candidates: list[str] = []
     for item in info.get("requested_downloads") or []:
         if isinstance(item, dict):
-            for key in ["filepath", "_filename", "filename"]:
+            for key in ("filepath", "_filename", "filename"):
                 value = item.get(key)
                 if value:
                     candidates.append(str(value))
-    for key in ["filepath", "_filename", "filename"]:
+    for key in ("filepath", "_filename", "filename"):
         value = info.get(key)
         if value:
             candidates.append(str(value))
@@ -685,20 +681,45 @@ def find_file(info: dict[str, Any], ydl: yt_dlp.YoutubeDL) -> str | None:
         pass
     if info.get("id"):
         candidates.extend(glob.glob(str(DOWNLOAD_DIR / f"*{info['id']}*")))
-    existing = [str(Path(path)) for path in candidates if path and Path(path).exists()]
+    existing = [str(Path(p)) for p in candidates if p and Path(p).exists()]
     existing.sort(key=lambda x: Path(x).stat().st_mtime, reverse=True)
     return existing[0] if existing else None
 
 
-def format_selector(platform: str | None, audio: bool, quality: str) -> str:
+def format_selector(
+    platform: str | None,
+    audio: bool,
+    quality: str,
+    has_ffmpeg: bool = True,
+) -> str:
+    """
+    Формат-селектор для yt-dlp.
+
+    КРИТИЧНО: для YouTube audio НЕМАЄ окремих форматів без DASH.
+    Тому для аудіо ми завжди просимо bestaudio — але DASH маніфести
+    мають бути доступні (не пропускатися в extractor_args).
+    """
     if audio:
-        return "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
-    if not FFMPEG_PATH:
+        if has_ffmpeg:
+            # ffmpeg є — беремо будь-яке аудіо, конвертуємо в mp3
+            return "bestaudio/best"
+        else:
+            # ffmpeg немає — пробуємо взяти m4a/webm без конвертації
+            return (
+                "bestaudio[ext=m4a]/bestaudio[ext=webm]/"
+                "bestaudio[ext=opus]/bestaudio/best"
+            )
+
+    # --- Відео ---
+    if not has_ffmpeg:
+        # Без ffmpeg — тільки вже злиті формати
         if quality == "mobile":
             return "best[height<=480][ext=mp4]/best[height<=480]/best"
         if quality == "best":
             return "best[ext=mp4]/best"
         return "best[height<=720][ext=mp4]/best[height<=720]/best"
+
+    # З ffmpeg — можемо мержити video + audio
     if quality == "mobile":
         return (
             "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
@@ -709,9 +730,29 @@ def format_selector(platform: str | None, audio: bool, quality: str) -> str:
             "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
             "best[height<=720][ext=mp4]/best[height<=720]/best"
         )
+    # best
     if platform == "youtube":
-        return "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best[ext=mp4]/best"
-    return "best[ext=mp4]/best"
+        return "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/best"
+    return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+
+
+def _build_user_agent(platform: str | None) -> str:
+    if platform == "tiktok":
+        return (
+            "com.zhiliaoapp.musically/2022600030 "
+            "(Linux; U; Android 12; en_US; Pixel 6; Build/SP1A.210812.016)"
+        )
+    if platform == "instagram":
+        return (
+            "Mozilla/5.0 (Linux; Android 14; SM-S918B) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Mobile Safari/537.36"
+        )
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
 
 
 def ytdlp_opts(
@@ -721,24 +762,13 @@ def ytdlp_opts(
     hook=None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    user_agent = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-    if platform == "tiktok":
-        user_agent = (
-            "com.zhiliaoapp.musically/2022600030 "
-            "(Linux; U; Android 12; en_US; Pixel 6; Build/SP1A.210812.016)"
-        )
-    if platform == "instagram":
-        user_agent = (
-            "Mozilla/5.0 (Linux; Android 14; SM-S918B) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-        )
+    has_ffmpeg = bool(FFMPEG_PATH)
 
     opts: dict[str, Any] = {
-        "format": format_selector(platform, audio, quality),
-        "outtmpl": str(DOWNLOAD_DIR / "%(extractor_key)s_%(id)s_%(title).80s.%(ext)s"),
+        "format": format_selector(platform, audio, quality, has_ffmpeg),
+        "outtmpl": str(
+            DOWNLOAD_DIR / "%(extractor_key)s_%(id)s_%(title).80s.%(ext)s"
+        ),
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -747,17 +777,17 @@ def ytdlp_opts(
         "fragment_retries": 5,
         "socket_timeout": 30,
         "continuedl": False,
-        "concurrent_fragment_downloads": 2,
+        "concurrent_fragment_downloads": 3,
         "http_chunk_size": 4 * 1024 * 1024,
         "http_headers": {
-            "User-Agent": user_agent,
+            "User-Agent": _build_user_agent(platform),
             "Accept-Language": "en-US,en;q=0.9",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
         "progress_hooks": [hook] if hook else [],
     }
 
-    if FFMPEG_PATH:
+    if has_ffmpeg:
         opts["ffmpeg_location"] = FFMPEG_PATH
         if not audio:
             opts["merge_output_format"] = "mp4"
@@ -770,19 +800,26 @@ def ytdlp_opts(
                 }
             ]
 
+    # --- Cookies ---
     ck = cookies_file()
     if ck:
         opts["cookiefile"] = ck
 
+    # --- Platform-specific extractor args ---
     if platform == "youtube":
+        # КРИТИЧНИЙ ФІКС: для аудіо НЕ пропускаємо dash_manifests,
+        # бо audio-only формати живуть тільки в DASH
+        skip_list = ["translated_subs"]
+        if not audio:
+            skip_list.append("dash_manifests")
         opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "web"],
-                "skip": ["translated_subs", "dash_manifests"],
+                "player_client": ["android", "ios", "web"],
+                "skip": skip_list,
             }
         }
 
-    if platform == "tiktok":
+    elif platform == "tiktok":
         opts["extractor_args"] = {
             "tiktok": {
                 "app_version": "26.2.0",
@@ -790,19 +827,18 @@ def ytdlp_opts(
             }
         }
 
-    if platform == "instagram":
-        opts["extractor_args"] = {
-            "instagram": {
-                "api_version": "v1",
-            }
-        }
+    elif platform == "instagram":
+        # КРИТИЧНИЙ ФІКС: НЕ встановлюємо api_version!
+        # yt-dlp сам обирає правильний API (GraphQL).
+        # api_version: "v1" примусово вмикає мертвий REST API.
+        pass
 
     if extra:
         opts.update(extra)
     return opts
 
 
-# ─────────────────────────── Downloaders ───────────────────────
+# ─────────────────────────── Stream download ───────────────────
 
 def stream_download(
     url: str,
@@ -835,10 +871,7 @@ def stream_download(
                     if progress_cb:
                         progress_cb(
                             progress_text(
-                                "⏳ Завантажую файл",
-                                done,
-                                total,
-                                start,
+                                "⏳ Завантажую файл", done, total, start
                             )
                         )
         return str(filepath), safe_text(title, 180)
@@ -849,6 +882,8 @@ def stream_download(
         remove_file(filepath)
         return None, f"Помилка прямого завантаження: {e}"
 
+
+# ─────────────────────────── TikTok fallbacks ──────────────────
 
 def tiktok_fallback_tikwm(
     url: str,
@@ -918,6 +953,71 @@ def tiktok_fallback_snaptik(
         return None, f"SnapTik: {e}"
 
 
+# ─────────────────────────── Cobalt.tools fallback ─────────────
+
+def download_via_cobalt(
+    url: str,
+    audio: bool,
+    quality: str,
+    progress_cb=None,
+    cancel_event: Event | None = None,
+) -> tuple[str | None, str]:
+    """
+    Універсальний фолбек через cobalt.tools API.
+    Працює для YouTube, Instagram, TikTok, Twitter, тощо.
+    """
+    quality_map = {"best": "1080", "fast": "720", "mobile": "360"}
+    try:
+        body: dict[str, Any] = {
+            "url": url,
+            "videoQuality": quality_map.get(quality, "720"),
+            "audioFormat": "mp3",
+            "isAudioOnly": audio,
+            "disableMetadata": True,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "VideoDownloaderBot/1.0",
+        }
+        if progress_cb:
+            progress_cb("🔄 Пробую альтернативний сервіс...")
+        resp = requests.post(
+            "https://api.cobalt.tools/",
+            json=body,
+            headers=headers,
+            timeout=45,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        status = data.get("status")
+        if status not in ("redirect", "tunnel", "stream"):
+            return None, f"Cobalt: непідтримуваний статус '{status}'"
+
+        download_url = data.get("url")
+        if not download_url:
+            return None, "Cobalt: немає URL у відповіді"
+
+        ext = "mp3" if audio else "mp4"
+        label = "Audio" if audio else "Video"
+        return stream_download(
+            download_url,
+            safe_filename("cobalt", url, ext),
+            label,
+            progress_cb,
+            cancel_event,
+        )
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            return None, "Cobalt: rate limit. Спробуй пізніше."
+        return None, f"Cobalt HTTP {e.response.status_code if e.response else '?'}: {e}"
+    except Exception as e:
+        return None, f"Cobalt: {e}"
+
+
+# ─────────────────────────── Direct download ───────────────────
+
 def download_direct(
     url: str,
     progress_cb=None,
@@ -935,6 +1035,8 @@ def download_direct(
     )
 
 
+# ─────────────────────────── yt-dlp process worker ─────────────
+
 def _ytdlp_worker(
     url: str,
     platform: str | None,
@@ -945,7 +1047,7 @@ def _ytdlp_worker(
     result_queue: "mp.Queue",
     cancel_event: "mp.Event",
 ) -> None:
-    """Запускається в окремому процесі для підтримки справжнього скасування."""
+    """Запускається в окремому процесі для справжнього скасування."""
     start = time.monotonic()
 
     def hook(data: dict[str, Any]) -> None:
@@ -955,15 +1057,16 @@ def _ytdlp_worker(
             return
         status = data.get("status")
         if status == "downloading":
-            total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+            total = (
+                data.get("total_bytes")
+                or data.get("total_bytes_estimate")
+                or 0
+            )
             done = data.get("downloaded_bytes") or 0
             try:
                 progress_queue.put_nowait(
                     progress_text(
-                        "⏳ Завантажую",
-                        int(done or 0),
-                        int(total or 0),
-                        start,
+                        "⏳ Завантажую", int(done or 0), int(total or 0), start
                     )
                 )
             except Exception:
@@ -973,20 +1076,45 @@ def _ytdlp_worker(
                 progress_queue.put_nowait("🔧 Обробляю файл...")
             except Exception:
                 pass
+        elif status == "processing":
+            try:
+                progress_queue.put_nowait("🔧 Обробляю файл...")
+            except Exception:
+                pass
 
     try:
-        with yt_dlp.YoutubeDL(
-            ytdlp_opts(platform, audio, quality, hook, extra_opts)
-        ) as ydl:
+        opts = ytdlp_opts(platform, audio, quality, hook, extra_opts)
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = first_entry(ydl.extract_info(url, download=True))
             path = find_file(info, ydl)
+
+            # Для аудіо з ffmpeg — шукаємо .mp3 файл
             if audio and path and FFMPEG_PATH:
                 mp3_path = str(Path(path).with_suffix(".mp3"))
                 if Path(mp3_path).exists():
                     path = mp3_path
+                else:
+                    # ffmpeg міг створити файл з іншою назвою
+                    mp3_candidates = list(DOWNLOAD_DIR.glob(f"*{info.get('id', '')}*.mp3"))
+                    if mp3_candidates:
+                        mp3_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                        path = str(mp3_candidates[0])
+
             if not path or not Path(path).exists():
-                result_queue.put(("error", None, "Файл після завантаження не знайдено."))
+                result_queue.put(
+                    ("error", None, "Файл після завантаження не знайдено.")
+                )
                 return
+
+            # Перевірка розміру
+            size = Path(path).stat().st_size
+            if size == 0:
+                remove_file(path)
+                result_queue.put(
+                    ("error", None, "Завантажений файл порожній (0 байт).")
+                )
+                return
+
             result_queue.put(("ok", path, safe_text(info.get("title"), 180)))
     except DownloadCancelled as e:
         result_queue.put(("cancelled", None, str(e)))
@@ -1003,7 +1131,7 @@ def download_via_ytdlp(
     cancel_event: Event | None = None,
     extra_opts: dict[str, Any] | None = None,
 ) -> tuple[str | None, str]:
-    """yt-dlp тепер працює в окремому процесі — /cancel вбиває процес."""
+    """yt-dlp в окремому процесі — /cancel вбиває процес."""
     ctx = mp.get_context("spawn")
     progress_queue: "mp.Queue" = ctx.Queue()
     result_queue: "mp.Queue" = ctx.Queue()
@@ -1047,7 +1175,16 @@ def download_via_ytdlp(
             _drain_progress()
             time.sleep(0.2)
 
-        p.join()
+        # Таймаут на випадок якщо процес завис
+        p.join(timeout=10)
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=5)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=5)
+            return None, "⏰ Завантаження занадто довге (таймаут). Спробуй /quality mobile."
+
         _drain_progress()
 
         try:
@@ -1071,6 +1208,8 @@ def download_via_ytdlp(
         return None, f"Помилка завантажувача: {e}"
 
 
+# ─────────────────────────── Main download orchestrator ────────
+
 def download_media(
     url: str,
     platform: str | None,
@@ -1079,39 +1218,136 @@ def download_media(
     progress_cb=None,
     cancel_event: Event | None = None,
 ) -> tuple[str | None, str]:
+    """
+    Головний оркестратор завантажень.
+    Реалізує стратегію фолбеків для кожної платформи.
+    """
+    url = normalize_url(url)
+
+    # 1. Прямі посилання на відео
     if DIRECT_VIDEO_RE.search(url) and not audio:
         return download_direct(url, progress_cb, cancel_event)
 
+    # 2. ─── INSTAGRAM: спеціальна стратегія ───
+    if platform == "instagram":
+        has_cookies = bool(cookies_file())
+
+        # 2a. Без cookies — спочатку пробуємо ddinstagram проксі
+        if not has_cookies:
+            if progress_cb:
+                progress_cb("🔄 Instagram через проксі (ddinstagram)...")
+            ddurl = to_ddinstagram(url)
+            path, result = download_via_ytdlp(
+                ddurl, "instagram", audio, quality, progress_cb, cancel_event
+            )
+            if path:
+                return path, result
+            if cancel_event and cancel_event.is_set():
+                return None, "Завантаження скасовано."
+
+        # 2b. Пробуємо прямий yt-dlp (з cookies або без)
+        if progress_cb:
+            progress_cb("🔄 Instagram через yt-dlp...")
+        path, result = download_via_ytdlp(
+            url, "instagram", audio, quality, progress_cb, cancel_event
+        )
+        if path:
+            return path, result
+        if cancel_event and cancel_event.is_set():
+            return None, "Завантаження скасовано."
+
+        # 2c. Фолбек на cobalt.tools
+        if progress_cb:
+            progress_cb("🔄 Instagram через cobalt...")
+        path, result = download_via_cobalt(
+            url, audio, quality, progress_cb, cancel_event
+        )
+        if path:
+            return path, result
+
+        # 2d. Усі спроби провалились
+        return None, result or "Instagram: не вдалося завантажити."
+
+    # 3. ─── TIKTOK: tikwm → yt-dlp ───
     if platform == "tiktok" and not audio:
         if progress_cb:
-            progress_cb("🔁 TikTok no-watermark...")
+            progress_cb("🔄 TikTok no-watermark (tikwm)...")
         path, result = tiktok_fallback_tikwm(url, progress_cb, cancel_event)
         if path:
             return path, result
+        if cancel_event and cancel_event.is_set():
+            return None, "Завантаження скасовано."
+
         if progress_cb:
-            progress_cb("🔁 TikTok fallback #2...")
-        path, result = tiktok_fallback_snaptik(url, progress_cb, cancel_event)
+            progress_cb("🔄 TikTok yt-dlp...")
+        path, result = download_via_ytdlp(
+            url, "tiktok", audio, quality, progress_cb, cancel_event
+        )
         if path:
             return path, result
-        if progress_cb:
-            progress_cb("🔁 TikTok yt-dlp...")
+        return None, result or "TikTok: не вдалося завантажити."
 
+    # 4. ─── TIKTOK AUDIO: yt-dlp → cobalt ───
+    if platform == "tiktok" and audio:
+        path, result = download_via_ytdlp(
+            url, "tiktok", audio, quality, progress_cb, cancel_event
+        )
+        if path:
+            return path, result
+        if cancel_event and cancel_event.is_set():
+            return None, "Завантаження скасовано."
+        path, result = download_via_cobalt(
+            url, audio, quality, progress_cb, cancel_event
+        )
+        if path:
+            return path, result
+        return None, result or "TikTok audio: не вдалося."
+
+    # 5. ─── YOUTUBE: yt-dlp з ретраями → cobalt ───
+    if platform == "youtube":
+        last_error = ""
+        for attempt in range(1, MAX_RETRIES + 1):
+            if cancel_event and cancel_event.is_set():
+                return None, "Завантаження скасовано."
+            if attempt > 1:
+                wait = min(2 ** (attempt - 1), 10)
+                if progress_cb:
+                    progress_cb(f"🔁 Спроба {attempt}/{MAX_RETRIES} (за {wait}с)...")
+                time.sleep(wait)
+
+            path, result = download_via_ytdlp(
+                url, "youtube", audio, quality, progress_cb, cancel_event
+            )
+            if path:
+                return path, result
+            last_error = result
+            if not is_transient_error(result):
+                break
+
+        # Фолбек на cobalt
+        if progress_cb:
+            progress_cb("🔄 YouTube через cobalt...")
+        path, result = download_via_cobalt(
+            url, audio, quality, progress_cb, cancel_event
+        )
+        if path:
+            return path, result
+
+        return None, last_error or "YouTube: не вдалося завантажити."
+
+    # 6. ─── ІНШІ ПЛАТФОРМИ: yt-dlp з ретраями → cobalt ───
     last_error = ""
     for attempt in range(1, MAX_RETRIES + 1):
         if cancel_event and cancel_event.is_set():
             return None, "Завантаження скасовано."
         if attempt > 1:
+            wait = min(2 ** (attempt - 1), 10)
             if progress_cb:
-                progress_cb(f"🔁 Спроба {attempt}/{MAX_RETRIES}...")
-            time.sleep(min(2 ** (attempt - 1), 10))
+                progress_cb(f"🔁 Спроба {attempt}/{MAX_RETRIES} (за {wait}с)...")
+            time.sleep(wait)
 
         path, result = download_via_ytdlp(
-            url,
-            platform,
-            audio,
-            quality,
-            progress_cb,
-            cancel_event,
+            url, platform, audio, quality, progress_cb, cancel_event
         )
         if path:
             return path, result
@@ -1119,7 +1355,17 @@ def download_media(
         if not is_transient_error(result):
             break
 
-    return None, last_error or "Не вдалося завантажити відео."
+    # Фолбек на cobalt для підтримуваних платформ
+    if platform in COBALT_SUPPORTED:
+        if progress_cb:
+            progress_cb(f"🔄 {platform} через cobalt...")
+        path, result = download_via_cobalt(
+            url, audio, quality, progress_cb, cancel_event
+        )
+        if path:
+            return path, result
+
+    return None, last_error or "Не вдалося завантажити."
 
 
 # ─────────────────────────── Telegram helpers ──────────────────
@@ -1140,16 +1386,11 @@ async def safe_edit(message, text: str) -> None:
         err = str(e).lower()
         if "message is not modified" in err:
             return
-        if (
-            "can't parse entities" in err
-            or "can't find end" in err
-            or "can't find end of the entity" in err
-        ):
+        if "can't parse" in err or "can't find end" in err:
             try:
                 await message.edit_text(text)
                 return
             except Exception:
-                log.debug("edit fallback error", exc_info=True)
                 return
         log.debug("edit error: %s", e)
     except TelegramError as e:
@@ -1187,27 +1428,43 @@ async def send_media(
             progress_cb("📤 Надсилаю у Telegram...")
         title_clean = safe_text(title, 180)
         with open(path, "rb") as file:
-            if is_audio and path.suffix.lower() == ".mp3":
-                sent = await msg.reply_audio(
-                    audio=file,
-                    title=title_clean[:64],
-                    caption=f"🎵 {title_clean}",
-                    read_timeout=180,
-                    write_timeout=180,
-                    connect_timeout=60,
-                    pool_timeout=60,
-                )
-                return size, str(sent.audio.file_id if sent.audio else "")
             if is_audio:
-                sent = await msg.reply_document(
-                    document=file,
-                    caption=f"🎵 {title_clean}\nФайл не MP3, бо ffmpeg недоступний.",
-                    read_timeout=180,
-                    write_timeout=180,
-                    connect_timeout=60,
-                    pool_timeout=60,
-                )
-                return size, str(sent.document.file_id if sent.document else "")
+                ext = path.suffix.lower().lstrip(".")
+                # Telegram підтримує: mp3, m4a, ogg, wav, flac, aac
+                audio_exts = {"mp3", "m4a", "ogg", "wav", "flac", "aac", "opus", "webm"}
+                if ext in audio_exts:
+                    sent = await msg.reply_audio(
+                        audio=file,
+                        title=title_clean[:64],
+                        caption=f"🎵 {title_clean}",
+                        read_timeout=180,
+                        write_timeout=180,
+                        connect_timeout=60,
+                        pool_timeout=60,
+                    )
+                    return (
+                        size,
+                        str(sent.audio.file_id if sent.audio else ""),
+                    )
+                else:
+                    # Невідомий формат — як документ
+                    sent = await msg.reply_document(
+                        document=file,
+                        caption=(
+                            f"🎵 {title_clean}\n"
+                            f"Формат .{ext} — Telegram може не відтворити.\n"
+                            f"Для MP3 конвертації потрібен ffmpeg на сервері."
+                        ),
+                        read_timeout=180,
+                        write_timeout=180,
+                        connect_timeout=60,
+                        pool_timeout=60,
+                    )
+                    return (
+                        size,
+                        str(sent.document.file_id if sent.document else ""),
+                    )
+
             sent = await msg.reply_video(
                 video=file,
                 caption=f"✅ {title_clean}",
@@ -1226,22 +1483,27 @@ async def send_media(
         remove_file(filepath)
 
 
-async def send_cached(update: Update, file_id: str, title: str, is_audio: bool) -> None:
+async def send_cached(
+    update: Update, file_id: str, title: str, is_audio: bool
+) -> None:
     msg = update.effective_message
     if not msg:
         return
     title_clean = safe_text(title, 180)
-    if is_audio:
-        await msg.reply_audio(
-            audio=file_id,
-            title=title_clean[:64],
-            caption=f"🎵 {title_clean} (з кешу)",
-        )
-    else:
-        await msg.reply_video(
-            video=file_id,
-            caption=f"✅ {title_clean} (з кешу)",
-        )
+    try:
+        if is_audio:
+            await msg.reply_audio(
+                audio=file_id,
+                title=title_clean[:64],
+                caption=f"🎵 {title_clean} (з кешу)",
+            )
+        else:
+            await msg.reply_video(
+                video=file_id,
+                caption=f"✅ {title_clean} (з кешу)",
+            )
+    except Exception:
+        raise  # Нехай caller обробляє stale cache
 
 
 # ─────────────────────────── Core flow ─────────────────────────
@@ -1261,9 +1523,12 @@ async def download_and_send(
 
     if rate_limited(uid or cid):
         wait = retry_after_seconds(uid or cid)
-        await msg.reply_text(f"⏳ Забагато запитів. Спробуй ще раз через {wait}с.")
+        await msg.reply_text(
+            f"⏳ Забагато запитів. Спробуй ще раз через {wait}с."
+        )
         return
 
+    # Кеш
     cached = cache_get(url, audio)
     if cached:
         file_id, title = cached
@@ -1273,7 +1538,7 @@ async def download_and_send(
             await safe_delete(status)
             return
         except Exception:
-            await safe_edit(status, "❌ Кеш застарів. Завантажую заново...")
+            await safe_edit(status, "🔄 Кеш застарів. Завантажую заново...")
             URL_CACHE.pop(cache_key(url, audio), None)
 
     cancel_event = Event()
@@ -1297,7 +1562,9 @@ async def download_and_send(
 
         def progress_cb(text: str) -> None:
             now = time.monotonic()
-            important = text.startswith(("🔧", "📤", "✅", "🔁", "❌", "⚡", "🎵"))
+            important = text.startswith(
+                ("🔧", "📤", "✅", "🔁", "❌", "⚡", "🎵", "🔄", "⏰")
+            )
             if text == last_text[0]:
                 return
             if now - last_time[0] < PROGRESS_THROTTLE and not important:
@@ -1322,11 +1589,7 @@ async def download_and_send(
                 return
             await safe_edit(status, "✅ Завантажено. Надсилаю...")
             size, file_id = await send_media(
-                update,
-                path,
-                title,
-                audio,
-                progress_cb,
+                update, path, title, audio, progress_cb
             )
             if size:
                 record_history(uid, url, title, platform)
@@ -1348,7 +1611,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     urls = extract_urls(msg.text)
     if not urls:
-        await msg.reply_text("❌ Надішли посилання на відео.")
         return
     if len(urls) > 1:
         await msg.reply_text(f"🔗 Знайдено {len(urls)} посилання. Оброблю по черзі.")
@@ -1362,7 +1624,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
-        await update.effective_message.reply_text(USER_HELP_TEXT, parse_mode="Markdown")
+        await update.effective_message.reply_text(
+            USER_HELP_TEXT, parse_mode="Markdown"
+        )
 
 
 async def dl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1424,8 +1688,15 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not msg:
         return
     cid = chat_id(update)
+    q = quality_for(cid)
+    has_ff = "✅" if FFMPEG_PATH else "❌"
+    has_ck = "✅" if cookies_file() else "❌"
     await msg.reply_text(
-        f"⚙️ Налаштування\n\nЯкість: {quality_for(cid)}\n\nЩоб змінити якість, відправ /quality",
+        f"⚙️ Налаштування\n\n"
+        f"Якість: {q}\n"
+        f"ffmpeg: {has_ff}\n"
+        f"cookies.txt: {has_ck}\n\n"
+        f"Щоб змінити якість — /quality"
     )
 
 
@@ -1496,19 +1767,23 @@ async def platforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not update.effective_message:
         return
     text = "📡 Підтримувані платформи:\n" + "\n".join(
-        f"• {platform}" for platform in URL_PATTERNS
+        f"• {p}" for p in URL_PATTERNS
     )
     await update.effective_message.reply_text(text)
 
 
 # ─────────────────────────── Callbacks ─────────────────────────
 
-async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def quality_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     query = update.callback_query
     if not query:
         return
     await query.answer()
-    value = query.data.split(":")[1] if query.data and ":" in query.data else ""
+    value = (
+        query.data.split(":")[1] if query.data and ":" in query.data else ""
+    )
     if value not in {"best", "fast", "mobile"}:
         return
     message = query.message
@@ -1522,7 +1797,9 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 # ─────────────────────────── Error handler ─────────────────────
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def error_handler(
+    update: object, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     log.error("Unhandled error:", exc_info=context.error)
 
 
@@ -1550,29 +1827,19 @@ async def setup_bot_commands(app: Application) -> None:
 
 # ─────────────────────────── Main ──────────────────────────────
 
-_THREAD_POOL: ThreadPoolExecutor | None = None
-
-
-def get_thread_pool() -> ThreadPoolExecutor:
-    global _THREAD_POOL
-    if _THREAD_POOL is None:
-        _THREAD_POOL = ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOADS)
-    return _THREAD_POOL
-
-
 def build_application() -> Application:
-    app = Application.builder().token(TOKEN).post_init(setup_bot_commands).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(setup_bot_commands)
+        .build()
+    )
+
     if app.job_queue:
-        app.job_queue.run_repeating(
-            scheduled_cleanup,
-            interval=7200,
-            first=60,
-        )
+        app.job_queue.run_repeating(scheduled_cleanup, interval=7200, first=60)
     else:
-        log.warning(
-            "JobQueue недоступний. Перевір requirements: "
-            "python-telegram-bot[webhooks,job-queue]==20.7"
-        )
+        log.warning("JobQueue недоступний.")
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("dl", dl_command))
@@ -1585,53 +1852,46 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("queue", queue_command))
     app.add_handler(CommandHandler("ping", ping_command))
-    app.add_handler(CallbackQueryHandler(quality_callback, pattern=r"^quality:"))
+    app.add_handler(
+        CallbackQueryHandler(quality_callback, pattern=r"^quality:")
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     return app
 
 
 def main() -> None:
-    # Python 3.14 workaround: asyncio.get_event_loop() більше не створює цикл
     try:
         asyncio.get_event_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
     clean_old_files(False)
-    app = build_application()
+
     log.info("ffmpeg=%s", FFMPEG_PATH or "не знайдено")
     log.info("cookies=%s", cookies_file() or "не знайдено")
-    log.info("webhook_url=%s", WEBHOOK_URL or "не задано polling режим")
+    log.info("max_upload=%s", human_bytes(MAX_UPLOAD_BYTES))
+    log.info("download_timeout=%ds", DOWNLOAD_TIMEOUT)
+    log.info("parallel_downloads=%d", PARALLEL_DOWNLOADS)
+
+    app = build_application()
+
     if WEBHOOK_URL:
-        port = int(os.environ.get("PORT", "8443"))
-        log.info("Запускаю webhook на порту %d", port)
+        log.info("Starting with webhook: %s", WEBHOOK_URL)
         app.run_webhook(
             listen="0.0.0.0",
-            port=port,
+            port=int(os.environ.get("PORT", "8080")),
             url_path=TOKEN,
             webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
-            drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
         )
     else:
-        log.info("Запускаю polling")
-        try:
-            requests.get(
-                f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
-                params={"drop_pending_updates": "true"},
-                timeout=10,
-            ).raise_for_status()
-        except Exception as e:
-            log.warning("Не вдалося видалити webhook перед polling: %s", e)
+        log.info("Starting with polling")
         app.run_polling(
-            drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
         )
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        traceback.print_exc()
+    main()
