@@ -56,15 +56,31 @@ def _pip_install(package: str) -> None:
 def _ensure_deps() -> None:
     if os.environ.get("DISABLE_AUTO_INSTALL", "0") == "1":
         return
+
     deps = [
         ("requests", "requests>=2.31.0"),
-        ("yt_dlp", "yt-dlp"),
         ("telegram.ext", "python-telegram-bot[webhooks,job-queue]>=21.0,<22.0"),
     ]
     for module_name, package_name in deps:
         if not _module_ok(module_name):
             _pip_install(package_name)
-    bad = [module_name for module_name, _ in deps if not _module_ok(module_name)]
+
+    # yt-dlp релізиться дуже часто (буває й по кілька разів на тиждень) саме
+    # тому, що YouTube/TikTok/Instagram постійно змінюють захист. Якщо він
+    # вже стоїть, але застарілий — бот тихо почне все гірше і гірше качати
+    # з часом, і це буде виглядати як "бот зламався" без жодної причини в
+    # коді. Тому оновлюємо його при КОЖНОМУ старті (можна вимкнути прапорцем
+    # SKIP_YTDLP_UPDATE=1, якщо хочеш пришвидшити рестарти).
+    if not _module_ok("yt_dlp"):
+        _pip_install("yt-dlp")
+    elif os.environ.get("SKIP_YTDLP_UPDATE", "0") != "1":
+        try:
+            _pip_install("yt-dlp")
+        except Exception as exc:
+            print(f"[BOOT] Не вдалося оновити yt-dlp, працюю зі старою версією: {exc}", flush=True)
+
+    all_deps = deps + [("yt_dlp", "yt-dlp")]
+    bad = [module_name for module_name, _ in all_deps if not _module_ok(module_name)]
     if bad:
         raise RuntimeError("Не вдалося встановити залежності: " + ", ".join(bad))
 
@@ -75,14 +91,13 @@ _ensure_deps()
 
 import asyncio
 import glob
+import itertools
 import json
 import logging
 import multiprocessing as mp
 import re
 import shutil
 import time
-import traceback
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import partial
 from threading import Event
@@ -146,6 +161,24 @@ log = logging.getLogger("video-bot")
 
 FFMPEG_PATH = os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg")
 
+# З листопада 2025 yt-dlp офіційно вимагає зовнішній JS-рантайм (Deno,
+# Node, Bun або QuickJS) для повноцінного витягування YouTube-форматів —
+# без нього частина форматів (а часом і всі) буде "missing". Це НЕ баг
+# бота, а вимога самого yt-dlp через ускладнення JS-захисту YouTube.
+# Дет.: https://github.com/yt-dlp/yt-dlp/issues/15012
+JS_RUNTIME = next(
+    (p for p in (shutil.which(x) for x in ("deno", "node", "bun", "quickjs")) if p),
+    None,
+)
+
+# Публічний api.cobalt.tools захищений bot-protection (Turnstile) і
+# офіційно "не призначений для сторонніх проєктів без дозволу власника".
+# Якщо є власний інстанс cobalt або дозвіл/ключ — вкажи їх тут, інакше
+# цей фолбек просто не спрацює на публічному сервері (це очікувано).
+# Дет.: https://github.com/imputnet/cobalt/blob/main/docs/api.md
+COBALT_API_URL = os.environ.get("COBALT_API_URL", "https://api.cobalt.tools/").rstrip("/") + "/"
+COBALT_API_KEY = os.environ.get("COBALT_API_KEY")
+
 URL_RE = re.compile(r"https?://[^\s<>\"]+", re.I)
 DIRECT_VIDEO_RE = re.compile(
     r"https?://[^\s<>\"]+\.(?:mp4|mov|webm|m4v|mkv)(?:\?[^\s<>\"]*)?",
@@ -158,7 +191,7 @@ URL_PATTERNS: dict[str, re.Pattern[str]] = {
         re.I,
     ),
     "tiktok": re.compile(
-        r"(?:tiktok\.com/@[\w.-]+/video/\d+|tiktok\.com/t/|vt\.tiktok\.com/|vm\.tiktok\.com/|www\.tiktok\.com/|m\.tiktok\.com/)",
+        r"tiktok\.com/|vt\.tiktok\.com/|vm\.tiktok\.com/",
         re.I,
     ),
     "instagram": re.compile(
@@ -166,7 +199,7 @@ URL_PATTERNS: dict[str, re.Pattern[str]] = {
         re.I,
     ),
     "twitter": re.compile(
-        r"(?:twitter\.com|x\.com)/\w+/status/\d+",
+        r"(?:twitter\.com|x\.com)/(?:\w+/status|i/status|i/web/status)/\d+",
         re.I,
     ),
     "vimeo": re.compile(
@@ -174,16 +207,16 @@ URL_PATTERNS: dict[str, re.Pattern[str]] = {
         re.I,
     ),
     "reddit": re.compile(
-        r"reddit\.com/r/\w+/comments/",
+        r"reddit\.com/r/\w+/(?:comments|s)/|v\.redd\.it/",
         re.I,
     ),
     "facebook": re.compile(
-        r"facebook\.com/(?:watch/\?v=|watch\?v=|reel/|share/r/|share/v/|[\w.]+/videos/|video\.php)",
+        r"facebook\.com/(?:watch/\?v=|watch\?v=|reel/|share/r/|share/v/|[\w.]+/videos/|video\.php)|fb\.watch/",
         re.I,
     ),
     "likee": re.compile(r"likee\.video/|likee\.com/", re.I),
     "snapchat": re.compile(r"snapchat\.com/(?:spotlight|add)/", re.I),
-    "pinterest": re.compile(r"pinterest\.[a-z.]+/pin/\d+", re.I),
+    "pinterest": re.compile(r"pinterest\.[a-z.]+/pin/\d+|pin\.it/", re.I),
     "twitch": re.compile(r"twitch\.tv/(?:videos/\d+|clips/)", re.I),
     "dailymotion": re.compile(r"dailymotion\.com/video/", re.I),
     "rumble": re.compile(r"rumble\.com/v", re.I),
@@ -244,6 +277,13 @@ USER_BOT_COMMANDS = [
 
 # ─────────────────────────── State ─────────────────────────────
 
+# КРИТИЧНО: ключ - унікальний task_id, а НЕ chat_id. Раніше було по
+# chat_id, і якщо в одному чаті одночасно активні два завантаження
+# (два різні юзери, або один юзер встиг кинути другий лінк поки перший
+# ще качається - PARALLEL_DOWNLOADS це якраз і дозволяє), записи
+# перезаписували одне одного: /cancel міг скасувати чуже завантаження,
+# а finally-блок того, хто фінішував першим, зносив запис ще активного.
+_TASK_ID_COUNTER = itertools.count(1)
 CANCEL_EVENTS: dict[int, Event] = {}
 ACTIVE_TASKS: dict[int, dict[str, Any]] = {}
 URL_CACHE: dict[str, tuple[str, str, float, bool]] = {}
@@ -413,12 +453,17 @@ def normalize_url(url: str) -> str:
 
 
 def to_ddinstagram(url: str) -> str:
-    """Конвертує instagram.com URL у ddinstagram.com проксі."""
-    return (
-        url
-        .replace("www.instagram.com", "ddinstagram.com")
-        .replace("instagram.com", "ddinstagram.com")
-    )
+    """
+    Конвертує instagram.com URL у ddinstagram.com проксі.
+
+    БАГ, який тут був: ланцюжок двох .replace() ламав URL для
+    найпоширенішого формату www.instagram.com/... — після першої заміни
+    рядок містив "ddinstagram.com", а всередині нього є підрядок
+    "instagram.com" (з позиції 2), тож друга заміна спрацьовувала ЩЕ РАЗ
+    і давала "ddddinstagram.com" — домен, якого не існує. Один regex
+    без повторного проходу вирішує це раз і назавжди.
+    """
+    return re.sub(r"(?:www\.|m\.)?instagram\.com", "ddinstagram.com", url)
 
 
 def safe_filename(prefix: str, url: str, ext: str = "mp4") -> Path:
@@ -563,6 +608,21 @@ def friendly_error(platform: str | None, error: str) -> str:
 
     if "exit code 137" in low or "killed" in low:
         return "⚠️ Серверу не вистачило ресурсів. Постав /quality mobile і спробуй ще раз."
+
+    if any(x in low for x in ["max-filesize", "max_filesize", "larger than max", "exceeds max"]):
+        return (
+            "⚠️ Джерело більше за ліміт Telegram (50MB) — завантаження зупинено ще до старту.\n"
+            "Постав /quality mobile: там формати менші, це має допомогти."
+        )
+
+    if platform == "youtube" and "javascript runtime" in low:
+        return (
+            "⚠️ На сервері немає JS-рантайму (Deno/Node), а YouTube з листопада 2025 "
+            "вимагає його для повноцінного витягування форматів.\n\n"
+            "Постав Deno на сервері (офіційний спосіб — команда з "
+            "https://github.com/yt-dlp/yt-dlp/wiki/EJS), і частина відео, "
+            "які зараз не качаються (або якими бракує форматів), запрацюють."
+        )
 
     if platform == "youtube" and any(
         x in low
@@ -746,12 +806,12 @@ def _build_user_agent(platform: str | None) -> str:
         return (
             "Mozilla/5.0 (Linux; Android 14; SM-S918B) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Mobile Safari/537.36"
+            "Chrome/151.0.0.0 Mobile Safari/537.36"
         )
     return (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/151.0.0.0 Safari/537.36"
     )
 
 
@@ -779,6 +839,11 @@ def ytdlp_opts(
         "continuedl": False,
         "concurrent_fragment_downloads": 3,
         "http_chunk_size": 4 * 1024 * 1024,
+        # Немає сенсу качати те, що все одно не влізе в Telegram (50MB) —
+        # яkщо джерело віддає розмір заздалегідь, yt-dlp відсіє формат
+        # ще ДО завантаження замість того, щоб качати файл повністю
+        # і відкидати його аж на етапі відправки.
+        "max_filesize": MAX_UPLOAD_BYTES,
         "http_headers": {
             "User-Agent": _build_user_agent(platform),
             "Accept-Language": "en-US,en;q=0.9",
@@ -812,9 +877,16 @@ def ytdlp_opts(
         skip_list = ["translated_subs"]
         if not audio:
             skip_list.append("dash_manifests")
+        # player_client свідомо НЕ фіксуємо списком. YouTube і yt-dlp
+        # постійно міняють правила гри (po_token, дозволені клієнти,
+        # SABR-стрімінг) — yt-dlp-мейнтейнери підтримують дефолт
+        # (зараз це tv,ios,web, або tv,web з cookies) саме під ці зміни
+        # і оновлюють його з кожним релізом. Захардкоджений список тут
+        # гарантовано застаріє за кілька місяців і почне мовчки різати
+        # доступні формати. Раз yt-dlp тепер апдейтиться при кожному
+        # старті бота (див. _ensure_deps) — має сенс довіряти його дефолту.
         opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "ios", "web"],
                 "skip": skip_list,
             }
         }
@@ -963,8 +1035,18 @@ def download_via_cobalt(
     cancel_event: Event | None = None,
 ) -> tuple[str | None, str]:
     """
-    Універсальний фолбек через cobalt.tools API.
-    Працює для YouTube, Instagram, TikTok, Twitter, тощо.
+    Універсальний фолбек через cobalt API (актуальна схема, docs/api.md
+    у imputnet/cobalt). Стара схема (isAudioOnly, статус "stream") більше
+    не підтримується — cobalt зробив breaking change: тепер це
+    downloadMode ("auto"/"audio"/"mute"), а валідні статуси відповіді —
+    tunnel / redirect / picker / local-processing / error.
+
+    ВАЖЛИВО: публічний api.cobalt.tools захищений bot-protection
+    (Cloudflare Turnstile) і офіційно "не призначений для використання в
+    сторонніх проєктах без явного дозволу власника інстансу". Без свого
+    інстансу чи API-ключа (COBALT_API_KEY) цей фолбек, найімовірніше,
+    впаде з помилкою авторизації — це очікувана поведінка публічного
+    сервісу, а не баг бота.
     """
     quality_map = {"best": "1080", "fast": "720", "mobile": "360"}
     try:
@@ -972,7 +1054,7 @@ def download_via_cobalt(
             "url": url,
             "videoQuality": quality_map.get(quality, "720"),
             "audioFormat": "mp3",
-            "isAudioOnly": audio,
+            "downloadMode": "audio" if audio else "auto",
             "disableMetadata": True,
         }
         headers = {
@@ -980,24 +1062,42 @@ def download_via_cobalt(
             "Accept": "application/json",
             "User-Agent": "VideoDownloaderBot/1.0",
         }
+        if COBALT_API_KEY:
+            headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+
         if progress_cb:
             progress_cb("🔄 Пробую альтернативний сервіс...")
-        resp = requests.post(
-            "https://api.cobalt.tools/",
-            json=body,
-            headers=headers,
-            timeout=45,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+
+        resp = requests.post(COBALT_API_URL, json=body, headers=headers, timeout=45)
+
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+
+        if not resp.ok or data.get("status") == "error":
+            err = data.get("error") or {}
+            code = str(err.get("code") or f"http_{resp.status_code}")
+            if "auth" in code:
+                return None, (
+                    "Cobalt: публічний інстанс вимагає авторизації (bot-protection). "
+                    "Без власного інстансу/ключа (COBALT_API_KEY) це очікувано."
+                )
+            if resp.status_code == 429 or "rate" in code:
+                return None, "Cobalt: rate limit. Спробуй пізніше."
+            return None, f"Cobalt: {code}"
 
         status = data.get("status")
-        if status not in ("redirect", "tunnel", "stream"):
-            return None, f"Cobalt: непідтримуваний статус '{status}'"
+        download_url = None
+        if status in ("tunnel", "redirect"):
+            download_url = data.get("url")
+        elif status == "picker":
+            items = data.get("picker") or []
+            if items:
+                download_url = items[0].get("url")
 
-        download_url = data.get("url")
         if not download_url:
-            return None, "Cobalt: немає URL у відповіді"
+            return None, f"Cobalt: непідтримувана відповідь ('{status}')"
 
         ext = "mp3" if audio else "mp4"
         label = "Audio" if audio else "Video"
@@ -1008,10 +1108,6 @@ def download_via_cobalt(
             progress_cb,
             cancel_event,
         )
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 429:
-            return None, "Cobalt: rate limit. Спробуй пізніше."
-        return None, f"Cobalt HTTP {e.response.status_code if e.response else '?'}: {e}"
     except Exception as e:
         return None, f"Cobalt: {e}"
 
@@ -1151,6 +1247,7 @@ def download_via_ytdlp(
         ),
     )
     p.start()
+    deadline = time.monotonic() + DOWNLOAD_TIMEOUT
 
     def _drain_progress() -> None:
         while not progress_queue.empty():
@@ -1171,6 +1268,21 @@ def download_via_ytdlp(
                     p.kill()
                     p.join(timeout=5)
                 return None, "Завантаження скасовано."
+
+            if time.monotonic() > deadline:
+                # DOWNLOAD_TIMEOUT раніше читався з env і логувався, але
+                # ніде не перевірявся - завислий процес міг тримати слот
+                # PARALLEL_DOWNLOADS вічно. Тепер реально обмежуємо.
+                mp_cancel_event.set()
+                p.terminate()
+                p.join(timeout=5)
+                if p.is_alive():
+                    p.kill()
+                    p.join(timeout=5)
+                return None, (
+                    f"⏰ Перевищено ліміт часу завантаження ({DOWNLOAD_TIMEOUT}с). "
+                    f"Спробуй /quality mobile."
+                )
 
             _drain_progress()
             time.sleep(0.2)
@@ -1517,6 +1629,12 @@ async def download_and_send(
     msg = update.effective_message
     if not msg:
         return
+    # Нормалізуємо ОДИН раз і використовуємо цей самий варіант далі
+    # всюди: у кеші, історії та самому завантаженні. Раніше кеш/історія
+    # писались по "сирому" лінку, а download_media нормалізував його
+    # вже всередині - той самий контент з різним utm/трекінгом чи
+    # m.-піддоменом не потрапляв у кеш, хоча міг би.
+    url = normalize_url(url)
     cid = chat_id(update)
     uid = user_id(update)
     quality = quality_for(cid)
@@ -1541,39 +1659,46 @@ async def download_and_send(
             await safe_edit(status, "🔄 Кеш застарів. Завантажую заново...")
             URL_CACHE.pop(cache_key(url, audio), None)
 
+    task_id = next(_TASK_ID_COUNTER)
     cancel_event = Event()
-    CANCEL_EVENTS[cid] = cancel_event
-    ACTIVE_TASKS[cid] = {
+    CANCEL_EVENTS[task_id] = cancel_event
+    ACTIVE_TASKS[task_id] = {
         "url": url,
         "platform": platform,
         "audio": audio,
         "quality": quality,
         "started_at": time.time(),
         "user_id": uid,
+        "chat_id": cid,
     }
 
-    async with PARALLEL_LIMIT:
-        status = await msg.reply_text(
-            "🎵 Готую аудіо..." if audio else "⏳ Починаю завантаження..."
-        )
-        loop = asyncio.get_running_loop()
-        last_time = [0.0]
-        last_text = [""]
-
-        def progress_cb(text: str) -> None:
-            now = time.monotonic()
-            important = text.startswith(
-                ("🔧", "📤", "✅", "🔁", "❌", "⚡", "🎵", "🔄", "⏰")
+    # Миттєве підтвердження ДО входу в семафор PARALLEL_DOWNLOADS: якщо
+    # всі слоти зайняті, юзер раніше не бачив узагалі нічого, поки
+    # чекав на слот - виглядало так, ніби бот завис/не відповідає.
+    status = await msg.reply_text("🔗 Прийняв, стаю в чергу...")
+    try:
+        async with PARALLEL_LIMIT:
+            await safe_edit(
+                status,
+                "🎵 Готую аудіо..." if audio else "⏳ Починаю завантаження...",
             )
-            if text == last_text[0]:
-                return
-            if now - last_time[0] < PROGRESS_THROTTLE and not important:
-                return
-            last_time[0] = now
-            last_text[0] = text
-            asyncio.run_coroutine_threadsafe(safe_edit(status, text), loop)
+            loop = asyncio.get_running_loop()
+            last_time = [0.0]
+            last_text = [""]
 
-        try:
+            def progress_cb(text: str) -> None:
+                now = time.monotonic()
+                important = text.startswith(
+                    ("🔧", "📤", "✅", "🔁", "❌", "⚡", "🎵", "🔄", "⏰")
+                )
+                if text == last_text[0]:
+                    return
+                if now - last_time[0] < PROGRESS_THROTTLE and not important:
+                    return
+                last_time[0] = now
+                last_text[0] = text
+                asyncio.run_coroutine_threadsafe(safe_edit(status, text), loop)
+
             job = partial(
                 download_media,
                 url,
@@ -1596,11 +1721,11 @@ async def download_and_send(
                 if file_id:
                     cache_set(url, audio, file_id, title)
             await safe_delete(status)
-        finally:
-            CANCEL_EVENTS.pop(cid, None)
-            ACTIVE_TASKS.pop(cid, None)
-            clean_old_files(False)
-            cache_cleanup()
+    finally:
+        CANCEL_EVENTS.pop(task_id, None)
+        ACTIVE_TASKS.pop(task_id, None)
+        clean_old_files(False)
+        cache_cleanup()
 
 
 # ─────────────────────────── Handlers ──────────────────────────
@@ -1691,11 +1816,13 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     q = quality_for(cid)
     has_ff = "✅" if FFMPEG_PATH else "❌"
     has_ck = "✅" if cookies_file() else "❌"
+    has_js = f"✅ ({Path(JS_RUNTIME).name})" if JS_RUNTIME else "❌ (YouTube буде гірше качати)"
     await msg.reply_text(
         f"⚙️ Налаштування\n\n"
         f"Якість: {q}\n"
         f"ffmpeg: {has_ff}\n"
-        f"cookies.txt: {has_ck}\n\n"
+        f"cookies.txt: {has_ck}\n"
+        f"JS-рантайм (Deno/Node) для YouTube: {has_js}\n\n"
         f"Щоб змінити якість — /quality"
     )
 
@@ -1731,12 +1858,26 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     msg = update.effective_message
     if not msg:
         return
-    event = CANCEL_EVENTS.get(chat_id(update))
-    if not event:
-        await msg.reply_text("Немає активного завантаження.")
+    cid = chat_id(update)
+    uid = user_id(update)
+    # Скасовуємо тільки завдання САМЕ ЦЬОГО юзера в ЦЬОМУ чаті. Раніше
+    # /cancel шукав "хоч якесь" активне завдання в чаті по chat_id - у
+    # груповому чаті будь-хто міг випадково (чи навмисно) скасувати
+    # завантаження іншої людини.
+    matches = [
+        (tid, task)
+        for tid, task in ACTIVE_TASKS.items()
+        if task.get("chat_id") == cid and task.get("user_id") == uid
+    ]
+    if not matches:
+        await msg.reply_text("Немає активного завантаження, яке я можу тут для тебе скасувати.")
         return
-    event.set()
-    await msg.reply_text("🛑 Скасовую завантаження...")
+    for tid, _ in matches:
+        event = CANCEL_EVENTS.get(tid)
+        if event:
+            event.set()
+    word = "завантаження" if len(matches) == 1 else f"{len(matches)} завантаження"
+    await msg.reply_text(f"🛑 Скасовую {word}...")
 
 
 async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1744,16 +1885,12 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not msg:
         return
     uid = user_id(update)
-    tasks = [
-        (cid_key, task)
-        for cid_key, task in ACTIVE_TASKS.items()
-        if task.get("user_id") == uid
-    ]
+    tasks = [task for task in ACTIVE_TASKS.values() if task.get("user_id") == uid]
     if not tasks:
         await msg.reply_text("У тебе немає активних завантажень.")
         return
     lines = [f"📋 Твоїх активних: {len(tasks)}", ""]
-    for _, task in tasks:
+    for task in tasks:
         elapsed = seconds_text(time.time() - float(task["started_at"]))
         lines.append(
             f"• {task['platform']} | "
@@ -1801,6 +1938,15 @@ async def error_handler(
     update: object, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     log.error("Unhandled error:", exc_info=context.error)
+    # Раніше юзер при непередбаченій помилці не бачив НІЧОГО - виглядало,
+    # ніби бот просто завис/помер. Тепер хоч коротке повідомлення є.
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Сталася неочікувана помилка. Спробуй ще раз трохи пізніше."
+            )
+        except Exception:
+            pass
 
 
 # ─────────────────────────── Scheduled tasks ───────────────────
@@ -1870,6 +2016,7 @@ def main() -> None:
 
     log.info("ffmpeg=%s", FFMPEG_PATH or "не знайдено")
     log.info("cookies=%s", cookies_file() or "не знайдено")
+    log.info("js_runtime=%s", JS_RUNTIME or "не знайдено (YouTube без нього деградує - див. /settings)")
     log.info("max_upload=%s", human_bytes(MAX_UPLOAD_BYTES))
     log.info("download_timeout=%ds", DOWNLOAD_TIMEOUT)
     log.info("parallel_downloads=%d", PARALLEL_DOWNLOADS)
