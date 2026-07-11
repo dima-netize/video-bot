@@ -1343,6 +1343,14 @@ def download_media(
     # 2. ─── INSTAGRAM: спеціальна стратегія ───
     if platform == "instagram":
         has_cookies = bool(cookies_file())
+        # cobalt тут — це запасний варіант останньої надії, і майже
+        # завжди впаде на bot-protection (див. коментар у
+        # download_via_cobalt). Тому саме його помилка НЕ повинна бути
+        # тим, що бачить юзер — раніше `result` затирався на кожному
+        # кроці, і до фінального повідомлення доходила лише технічна
+        # помилка cobalt, а справжня причина (чому не спрацював
+        # ddinstagram-проксі й прямий yt-dlp) губилась мовчки.
+        primary_error: str | None = None
 
         # 2a. Без cookies — спочатку пробуємо ddinstagram проксі
         if not has_cookies:
@@ -1356,6 +1364,7 @@ def download_media(
                 return path, result
             if cancel_event and cancel_event.is_set():
                 return None, "Завантаження скасовано."
+            primary_error = result
 
         # 2b. Пробуємо прямий yt-dlp (з cookies або без)
         if progress_cb:
@@ -1367,6 +1376,10 @@ def download_media(
             return path, result
         if cancel_event and cancel_event.is_set():
             return None, "Завантаження скасовано."
+        # пряма спроба зазвичай інформативніша за проксі-спробу (та сама
+        # першопричина, але без зайвого шару проксі зверху) — тому саме
+        # її беремо як головну помилку, якщо вона теж не вдалась
+        primary_error = result
 
         # 2c. Фолбек на cobalt.tools
         if progress_cb:
@@ -1377,8 +1390,9 @@ def download_media(
         if path:
             return path, result
 
-        # 2d. Усі спроби провалились
-        return None, result or "Instagram: не вдалося завантажити."
+        # 2d. Усі спроби провалились — показуємо РЕАЛЬНУ причину
+        # (з yt-dlp/ddinstagram), а не технічний фейл cobalt
+        return None, primary_error or result or "Instagram: не вдалося завантажити."
 
     # 3. ─── TIKTOK: tikwm → yt-dlp ───
     if platform == "tiktok" and not audio:
