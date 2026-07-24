@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import shutil
 import site
 import subprocess
 import sys
@@ -71,18 +72,94 @@ def _ensure_deps() -> None:
     # з часом, і це буде виглядати як "бот зламався" без жодної причини в
     # коді. Тому оновлюємо його при КОЖНОМУ старті (можна вимкнути прапорцем
     # SKIP_YTDLP_UPDATE=1, якщо хочеш пришвидшити рестарти).
+    #
+    # "[default]" — КРИТИЧНО: саме цей extra тягне за собою yt-dlp-ejs,
+    # який виконує JS-челенджі YouTube. Без нього навіть з встановленим
+    # Deno/Node yt-dlp мовчки деградує на YouTube ("some formats missing"
+    # або взагалі "Unsupported URL" на частині відео). Це саме та причина,
+    # через яку бот міг виглядати так, ніби він "не приймає" YouTube.
+    YTDLP_PACKAGE = "yt-dlp[default]"
     if not _module_ok("yt_dlp"):
-        _pip_install("yt-dlp")
+        _pip_install(YTDLP_PACKAGE)
     elif os.environ.get("SKIP_YTDLP_UPDATE", "0") != "1":
         try:
-            _pip_install("yt-dlp")
+            _pip_install(YTDLP_PACKAGE)
         except Exception as exc:
             print(f"[BOOT] Не вдалося оновити yt-dlp, працюю зі старою версією: {exc}", flush=True)
 
-    all_deps = deps + [("yt_dlp", "yt-dlp")]
+    all_deps = deps + [("yt_dlp", YTDLP_PACKAGE)]
     bad = [module_name for module_name, _ in all_deps if not _module_ok(module_name)]
     if bad:
         raise RuntimeError("Не вдалося встановити залежності: " + ", ".join(bad))
+
+    _ensure_js_runtime()
+
+
+def _ensure_js_runtime() -> None:
+    """
+    З листопада 2025 yt-dlp офіційно вимагає зовнішній JS-рантайм (Deno,
+    Node, Bun або QuickJS), щоб повністю проходити JS-захист YouTube.
+    Без нього YouTube або взагалі не віддає формати, або віддає їх
+    настільки урізано, що виглядає так, ніби бот "не приймає" YouTube-
+    посилання — хоча насправді причина суто в оточенні сервера, а не в
+    коді бота. Дет.: https://github.com/yt-dlp/yt-dlp/wiki/EJS
+
+    Той самий підхід, що й для решти залежностей: якщо жодного рантайму
+    нема в PATH — тихо ставимо PyPI-пакет "deno" (офіційний бінарник
+    Deno, запакований під pip; не потребує root/apt/curl) і додаємо
+    його bin-теку в PATH цього процесу.
+    """
+    candidate_bins = [
+        BASE_DIR_BOOT / ".local" / "bin",
+        Path(site.getuserbase()) / "bin",
+        Path(site.getuserbase()) / "Scripts",  # Windows, про всяк випадок
+        Path(sys.prefix) / "bin",
+    ]
+
+    def _add_candidates_to_path() -> None:
+        current = os.environ.get("PATH", "")
+        parts = current.split(os.pathsep) if current else []
+        for d in candidate_bins:
+            try:
+                if d.exists() and str(d) not in parts:
+                    parts.insert(0, str(d))
+            except OSError:
+                pass
+        os.environ["PATH"] = os.pathsep.join(parts)
+
+    _add_candidates_to_path()
+    if any(shutil.which(x) for x in ("deno", "node", "bun", "quickjs")):
+        return
+
+    if os.environ.get("DISABLE_JS_RUNTIME_INSTALL", "0") == "1":
+        print(
+            "[BOOT] JS-рантайм не знайдено, автовстановлення вимкнено "
+            "(DISABLE_JS_RUNTIME_INSTALL=1). YouTube працюватиме гірше.",
+            flush=True,
+        )
+        return
+
+    try:
+        _pip_install("deno")
+    except Exception as exc:
+        print(
+            f"[BOOT] Не вдалося автоматично встановити JS-рантайм (deno): {exc}\n"
+            f"[BOOT] YouTube працюватиме гірше (частина форматів буде "
+            f"'missing'). За потреби постав Deno/Node вручну на сервері — "
+            f"див. https://github.com/yt-dlp/yt-dlp/wiki/EJS",
+            flush=True,
+        )
+        return
+
+    _add_candidates_to_path()
+    if any(shutil.which(x) for x in ("deno", "node", "bun", "quickjs")):
+        print("[BOOT] JS-рантайм (deno) встановлено та готовий до роботи.", flush=True)
+    else:
+        print(
+            "[BOOT] Пакет 'deno' встановився, але виконуваний файл не "
+            "знайдено в PATH. YouTube може працювати гірше.",
+            flush=True,
+        )
 
 
 _ensure_deps()
@@ -171,6 +248,11 @@ JS_RUNTIME = next(
     None,
 )
 
+try:
+    YTDLP_VERSION = yt_dlp.version.__version__
+except Exception:
+    YTDLP_VERSION = "unknown"
+
 # Публічний api.cobalt.tools захищений bot-protection (Turnstile) і
 # офіційно "не призначений для сторонніх проєктів без дозволу власника".
 # Якщо є власний інстанс cobalt або дозвіл/ключ — вкажи їх тут, інакше
@@ -250,14 +332,14 @@ USER_HELP_TEXT = """🎥 *Video Downloader Bot*
 /queue — твої активні завантаження
 /history — історія
 /settings — налаштування
-/quality — якість: best / fast / mobile
+/quality — якість: 1440 / 1080 / 720
 /platforms — список платформ
 /ping — перевірка бота
 
 *💡 Поради:*
-• Instagram без cookies — працює через проксі (ddinstagram).
+• Instagram без cookies — пробує кілька способів по черзі (yt-dlp, проксі, cobalt).
 • YouTube без cookies — може блокувати, додай cookies.txt.
-• Якщо відео велике — постав /quality mobile.
+• Якщо відео велике (>50MB, ліміт Telegram) — постав /quality 720.
 • Для скасування надішли /cancel під час завантаження.
 """
 
@@ -390,7 +472,7 @@ def user_id(update: Update) -> int:
 
 
 def quality_for(cid: int) -> str:
-    return SETTINGS.get("quality", {}).get(str(cid), "fast")
+    return SETTINGS.get("quality", {}).get(str(cid), "1080")
 
 
 def cookies_file() -> str | None:
@@ -499,9 +581,9 @@ def quality_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🏆 best", callback_data="quality:best"),
-                InlineKeyboardButton("⚡ fast", callback_data="quality:fast"),
-                InlineKeyboardButton("📱 mobile", callback_data="quality:mobile"),
+                InlineKeyboardButton("🎬 1440p", callback_data="quality:1440"),
+                InlineKeyboardButton("⭐ 1080p", callback_data="quality:1080"),
+                InlineKeyboardButton("📱 720p", callback_data="quality:720"),
             ]
         ]
     )
@@ -607,12 +689,12 @@ def friendly_error(platform: str | None, error: str) -> str:
     low = err.lower()
 
     if "exit code 137" in low or "killed" in low:
-        return "⚠️ Серверу не вистачило ресурсів. Постав /quality mobile і спробуй ще раз."
+        return "⚠️ Серверу не вистачило ресурсів. Постав /quality 720 і спробуй ще раз."
 
     if any(x in low for x in ["max-filesize", "max_filesize", "larger than max", "exceeds max"]):
         return (
             "⚠️ Джерело більше за ліміт Telegram (50MB) — завантаження зупинено ще до старту.\n"
-            "Постав /quality mobile: там формати менші, це має допомогти."
+            "Постав /quality 720: там формати менші, це має допомогти."
         )
 
     if platform == "youtube" and "javascript runtime" in low:
@@ -672,10 +754,10 @@ def friendly_error(platform: str | None, error: str) -> str:
         )
 
     if "requested format is not available" in low:
-        return "⚠️ Ця якість недоступна. Спробуй /quality fast або /quality mobile."
+        return "⚠️ Ця якість недоступна. Спробуй /quality 1080 або /quality 720."
 
     if "ffmpeg" in low and not FFMPEG_PATH:
-        return "⚠️ Немає ffmpeg на сервері. Для аудіо потрібен ffmpeg. Спробуй /quality fast для відео."
+        return "⚠️ Немає ffmpeg на сервері. Для аудіо потрібен ffmpeg. Спробуй /quality 720 для відео."
 
     if "unsupported url" in low:
         return "❌ Посилання не підтримується або платформа змінила захист."
@@ -758,6 +840,12 @@ def format_selector(
     КРИТИЧНО: для YouTube audio НЕМАЄ окремих форматів без DASH.
     Тому для аудіо ми завжди просимо bestaudio — але DASH маніфести
     мають бути доступні (не пропускатися в extractor_args).
+
+    Якість відео — РІВНО ТРИ фіксовані варіанти-стелі за висотою кадру:
+    720p / 1080p / 1440p. "height<=N" у yt-dlp — це саме стеля, а не
+    жорстка вимога: якщо в джерела нема потрібної висоти, yt-dlp сам
+    візьме найближчу нижчу з того, що є, тож окремий ланцюжок фолбеків
+    на менші висоти тут не потрібен.
     """
     if audio:
         if has_ffmpeg:
@@ -770,30 +858,19 @@ def format_selector(
                 "bestaudio[ext=opus]/bestaudio/best"
             )
 
-    # --- Відео ---
-    if not has_ffmpeg:
-        # Без ffmpeg — тільки вже злиті формати
-        if quality == "mobile":
-            return "best[height<=480][ext=mp4]/best[height<=480]/best"
-        if quality == "best":
-            return "best[ext=mp4]/best"
-        return "best[height<=720][ext=mp4]/best[height<=720]/best"
+    # --- Відео: висота-стеля за обраною якістю ---
+    height = {"720": 720, "1080": 1080, "1440": 1440}.get(quality, 1080)
 
-    # З ffmpeg — можемо мержити video + audio
-    if quality == "mobile":
-        return (
-            "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=480][ext=mp4]/best[height<=480]/best"
-        )
-    if quality == "fast":
-        return (
-            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=720][ext=mp4]/best[height<=720]/best"
-        )
-    # best
-    if platform == "youtube":
-        return "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/best"
-    return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+    if not has_ffmpeg:
+        # Без ffmpeg — тільки вже злиті (муксовані) формати
+        return f"best[height<={height}][ext=mp4]/best[height<={height}]/best"
+
+    # З ffmpeg — можемо мержити окремі video+audio доріжки в mp4
+    return (
+        f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={height}]+bestaudio/"
+        f"best[height<={height}][ext=mp4]/best[height<={height}]/best"
+    )
 
 
 def _build_user_agent(platform: str | None) -> str:
@@ -1048,11 +1125,12 @@ def download_via_cobalt(
     впаде з помилкою авторизації — це очікувана поведінка публічного
     сервісу, а не баг бота.
     """
-    quality_map = {"best": "1080", "fast": "720", "mobile": "360"}
     try:
         body: dict[str, Any] = {
             "url": url,
-            "videoQuality": quality_map.get(quality, "720"),
+            # cobalt приймає рядки "144".."2160"/"max" — наші три рівні
+            # якості (720/1080/1440) співпадають з ними один-в-один.
+            "videoQuality": quality if quality in {"720", "1080", "1440"} else "1080",
             "audioFormat": "mp3",
             "downloadMode": "audio" if audio else "auto",
             "disableMetadata": True,
@@ -1281,7 +1359,7 @@ def download_via_ytdlp(
                     p.join(timeout=5)
                 return None, (
                     f"⏰ Перевищено ліміт часу завантаження ({DOWNLOAD_TIMEOUT}с). "
-                    f"Спробуй /quality mobile."
+                    f"Спробуй /quality 720."
                 )
 
             _drain_progress()
@@ -1295,7 +1373,7 @@ def download_via_ytdlp(
             if p.is_alive():
                 p.kill()
                 p.join(timeout=5)
-            return None, "⏰ Завантаження занадто довге (таймаут). Спробуй /quality mobile."
+            return None, "⏰ Завантаження занадто довге (таймаут). Спробуй /quality 720."
 
         _drain_progress()
 
@@ -1342,44 +1420,58 @@ def download_media(
 
     # 2. ─── INSTAGRAM: спеціальна стратегія ───
     if platform == "instagram":
-        has_cookies = bool(cookies_file())
         # cobalt тут — це запасний варіант останньої надії, і майже
         # завжди впаде на bot-protection (див. коментар у
         # download_via_cobalt). Тому саме його помилка НЕ повинна бути
         # тим, що бачить юзер — раніше `result` затирався на кожному
         # кроці, і до фінального повідомлення доходила лише технічна
-        # помилка cobalt, а справжня причина (чому не спрацював
-        # ddinstagram-проксі й прямий yt-dlp) губилась мовчки.
+        # помилка cobalt, а справжня причина губилась мовчки.
         primary_error: str | None = None
 
-        # 2a. Без cookies — спочатку пробуємо ddinstagram проксі
-        if not has_cookies:
-            if progress_cb:
-                progress_cb("🔄 Instagram через проксі (ddinstagram)...")
-            ddurl = to_ddinstagram(url)
+        # 2a. Прямий yt-dlp — ПЕРШИЙ крок (з cookies, якщо вони є, або
+        # без них). У релізі yt-dlp 2026.07.04 істотно полагодили
+        # авторизацію Instagram для публічних reels/постів без логіну,
+        # тож ховати цей шлях за проксі більше немає сенсу — навпаки,
+        # проксі (ddinstagram) інколи віддає гірші метадані/якість.
+        # Додаємо той самий ретрай на тимчасові помилки, що й для
+        # YouTube — раніше Instagram не ретраївся взагалі, і одна
+        # мережева гикавка одразу відправляла в (нестабільний) cobalt.
+        last_error = ""
+        for attempt in range(1, MAX_RETRIES + 1):
+            if cancel_event and cancel_event.is_set():
+                return None, "Завантаження скасовано."
+            if attempt > 1:
+                wait = min(2 ** (attempt - 1), 10)
+                if progress_cb:
+                    progress_cb(f"🔁 Instagram, спроба {attempt}/{MAX_RETRIES} (за {wait}с)...")
+                time.sleep(wait)
+            elif progress_cb:
+                progress_cb("🔄 Instagram через yt-dlp...")
             path, result = download_via_ytdlp(
-                ddurl, "instagram", audio, quality, progress_cb, cancel_event
+                url, "instagram", audio, quality, progress_cb, cancel_event
             )
             if path:
                 return path, result
             if cancel_event and cancel_event.is_set():
                 return None, "Завантаження скасовано."
-            primary_error = result
+            last_error = result
+            if not is_transient_error(result):
+                break
+        primary_error = last_error
 
-        # 2b. Пробуємо прямий yt-dlp (з cookies або без)
+        # 2b. Проксі ddinstagram (InstaFix) — читає og:video з embed-
+        # сторінки, іноді витягує те, що пряма спроба не бачить (і
+        # навпаки), тож лишаємо як фолбек, а не обов'язковий перший крок.
         if progress_cb:
-            progress_cb("🔄 Instagram через yt-dlp...")
+            progress_cb("🔄 Instagram через проксі (ddinstagram)...")
+        ddurl = to_ddinstagram(url)
         path, result = download_via_ytdlp(
-            url, "instagram", audio, quality, progress_cb, cancel_event
+            ddurl, "instagram", audio, quality, progress_cb, cancel_event
         )
         if path:
             return path, result
         if cancel_event and cancel_event.is_set():
             return None, "Завантаження скасовано."
-        # пряма спроба зазвичай інформативніша за проксі-спробу (та сама
-        # першопричина, але без зайвого шару проксі зверху) — тому саме
-        # її беремо як головну помилку, якщо вона теж не вдалась
-        primary_error = result
 
         # 2c. Фолбек на cobalt.tools
         if progress_cb:
@@ -1391,7 +1483,7 @@ def download_media(
             return path, result
 
         # 2d. Усі спроби провалились — показуємо РЕАЛЬНУ причину
-        # (з yt-dlp/ddinstagram), а не технічний фейл cobalt
+        # (з прямого yt-dlp), а не технічний фейл cobalt/проксі
         return None, primary_error or result or "Instagram: не вдалося завантажити."
 
     # 3. ─── TIKTOK: tikwm → yt-dlp ───
@@ -1547,7 +1639,7 @@ async def send_media(
         if size > MAX_UPLOAD_BYTES:
             await msg.reply_text(
                 "❌ Файл більший за ліміт Telegram Bot API (50MB).\n"
-                "Постав /quality mobile і спробуй ще раз."
+                "Постав /quality 720 і спробуй ще раз."
             )
             return 0, ""
         if progress_cb:
@@ -1809,17 +1901,21 @@ async def quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     cid = chat_id(update)
     if not context.args:
         await msg.reply_text(
-            f"⚙️ Поточна якість: {quality_for(cid)}\n\nОбери нову:",
+            f"⚙️ Поточна якість: {quality_for(cid)}p\n\nОбери нову:",
             reply_markup=quality_keyboard(),
         )
         return
-    value = context.args[0].lower().strip()
-    if value not in {"best", "fast", "mobile"}:
-        await msg.reply_text("❌ Доступно: best, fast, mobile")
+    # rstrip("p") — щоб приймати і "1080", і "1080p"
+    value = context.args[0].lower().strip().rstrip("p")
+    if value not in {"1440", "1080", "720"}:
+        await msg.reply_text("❌ Доступно: 1440, 1080, 720")
         return
     SETTINGS.setdefault("quality", {})[str(cid)] = value
     save_settings()
-    await msg.reply_text(f"✅ Якість змінено на: {value}")
+    text = f"✅ Якість змінено на: {value}p"
+    if value == "1440":
+        text += "\n⚠️ 1440p часто перевищує ліміт Telegram (50MB) — якщо файл не влізе, постав нижчу якість."
+    await msg.reply_text(text)
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1833,7 +1929,8 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     has_js = f"✅ ({Path(JS_RUNTIME).name})" if JS_RUNTIME else "❌ (YouTube буде гірше качати)"
     await msg.reply_text(
         f"⚙️ Налаштування\n\n"
-        f"Якість: {q}\n"
+        f"Якість: {q}p\n"
+        f"yt-dlp: {YTDLP_VERSION}\n"
         f"ffmpeg: {has_ff}\n"
         f"cookies.txt: {has_ck}\n"
         f"JS-рантайм (Deno/Node) для YouTube: {has_js}\n\n"
@@ -1909,7 +2006,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines.append(
             f"• {task['platform']} | "
             f"{'🎵' if task['audio'] else '🎬'} | "
-            f"{task['quality']} | ⏱ {elapsed}"
+            f"{task['quality']}p | ⏱ {elapsed}"
         )
     await msg.reply_text("\n".join(lines))
 
@@ -1935,7 +2032,7 @@ async def quality_callback(
     value = (
         query.data.split(":")[1] if query.data and ":" in query.data else ""
     )
-    if value not in {"best", "fast", "mobile"}:
+    if value not in {"1440", "1080", "720"}:
         return
     message = query.message
     if not message:
@@ -1943,7 +2040,10 @@ async def quality_callback(
     cid = int(message.chat.id)
     SETTINGS.setdefault("quality", {})[str(cid)] = value
     save_settings()
-    await query.edit_message_text(f"✅ Якість: {value}")
+    text = f"✅ Якість: {value}p"
+    if value == "1440":
+        text += "\n⚠️ Може перевищити ліміт Telegram (50MB)."
+    await query.edit_message_text(text)
 
 
 # ─────────────────────────── Error handler ─────────────────────
@@ -2028,6 +2128,7 @@ def main() -> None:
 
     clean_old_files(False)
 
+    log.info("yt-dlp version=%s", YTDLP_VERSION)
     log.info("ffmpeg=%s", FFMPEG_PATH or "не знайдено")
     log.info("cookies=%s", cookies_file() or "не знайдено")
     log.info("js_runtime=%s", JS_RUNTIME or "не знайдено (YouTube без нього деградує - див. /settings)")
